@@ -216,7 +216,7 @@ func (a *GotdAdapter) Start(ctx context.Context) error {
 		// Send active online report message on startup initialization & pre-cache active dialog peers
 		go func() {
 			time.Sleep(1 * time.Second)
-			statusText := "🐱 **BetterAgent 猫娘健康度指标**\n\n" +
+			statusText := "🟢 **BetterAgent 运行状态指标**\n\n" +
 				"• **系统状态**: 正常在线 🟢\n" +
 				"• **触发模式**: initialization\n" +
 				"• **短期记忆缓冲**: 0 条\n" +
@@ -510,7 +510,7 @@ func (a *GotdAdapter) handleGameStartStopCommand(ctx context.Context, chatID int
 				a.logger.Error("Failed to publish UserInterrupt on /game_stop", zap.Int64("chat_id", deactivatedChatID), zap.Error(err))
 			}
 		}
-		a.replyDirect(ctx, chatID, "游戏自动托管已停止，操作权还给主人啦。")
+		a.replyDirect(ctx, chatID, "游戏自动托管已停止，操作权已经还给你啦。")
 		return true
 	}
 	return false

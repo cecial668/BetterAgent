@@ -125,4 +125,13 @@ describe('createMMDAnimationManager', () => {
     expect(idleAction?.isRunning()).toBe(true)
     expect(gestureAction?.isRunning()).toBe(false)
   })
+
+  it('reports a registered motion duration and nothing for unknown names', () => {
+    const mmd = new RecordingMMD()
+    const manager = createMMDAnimationManager(mmd)
+    manager.registerClip('gesture', new AnimationClip('gesture', 2.5, []))
+
+    expect(manager.getClipDuration('gesture')).toBe(2.5)
+    expect(manager.getClipDuration('missing')).toBeUndefined()
+  })
 })

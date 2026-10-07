@@ -31,6 +31,11 @@ sqlalchemy>=2.0.0
 numpy>=1.26.0,<2.2.0
 aiohttp>=3.9.0
 
+# Chinese finals -> viseme mapping for services/tts/viseme_generator.py.
+# Without it the generator silently falls back to an ee/ih alternation, which
+# only ever produces tiny mouth shapes (broken-looking lip sync).
+pypinyin>=0.50.0
+
 # STT (services/stt/funasr_client.py bridges an external FunASR streaming
 # WebSocket server -- FunASR/torch itself deliberately not listed, see
 # services/stt/requirements.txt)

@@ -3,6 +3,7 @@ import type { AiriCard } from './airi-card'
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { buildBuiltinFurinaCard } from '../../constants/builtin-airi-cards'
 import { useSettingsStageModel } from '../settings/stage-model'
 import { useAiriCardStore } from './airi-card'
 
@@ -335,5 +336,15 @@ describe('airi-card store', () => {
 
     expect(cardStore.activeCardId).toBe('default')
     expect(cardStore.activeCard?.name).toBe('ReLU')
+  })
+
+  // 回归防线：内置芙宁娜卡不能把后端 TTS provider（gpt_sovits 等）写进
+  // 卡片 —— 前端 provider 注册表不认识它，激活时会抛
+  // "Provider metadata for gpt_sovits not found" 并把整页打崩。
+  it('builtin furina card never pins a backend-only speech provider', () => {
+    const card = buildBuiltinFurinaCard()
+    expect(card.extensions?.airi?.modules?.speech?.provider).toBeUndefined()
+    expect(card.extensions?.airi?.modules?.speech?.voice_id).toBeUndefined()
+    expect(card.extensions?.airi?.modules?.persona?.maxReplyLength).toBe(3)
   })
 })

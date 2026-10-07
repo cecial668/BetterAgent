@@ -43,6 +43,7 @@ import { getDefaultStreamingModel, getDefinedProvider } from '../../libs/provide
 import { OFFICIAL_SPEECH_PROVIDER_ID, OFFICIAL_SPEECH_STREAMING_PROVIDER_ID } from '../../libs/providers/providers/official'
 import { bindSpeakingStateToPlaybackManager } from '../../libs/speech/playback-speaking-state'
 import { createStageTtsSession } from '../../libs/speech/tts-session'
+import { betterAgentWSBridge } from '../../services/betteragent-ws'
 import { getSpeechBusContext, speechOutputGetPlaybackState } from '../../services/speech/bus'
 import { useAudioContext, useSpeakingStore } from '../../stores/audio'
 import { useBackgroundStore } from '../../stores/background'
@@ -50,6 +51,7 @@ import { useChatOrchestratorStore } from '../../stores/chat'
 import { useLlmStreamingControlStore } from '../../stores/llm-streaming-control'
 import { useAiriCardStore } from '../../stores/modules'
 import { useBetterAgentGatewayStore } from '../../stores/modules/betteragent-gateway'
+import { useLanguageModuleStore } from '../../stores/modules/language'
 import { useSpeechStore } from '../../stores/modules/speech'
 import { useProvidersStore } from '../../stores/providers'
 import { useSettings } from '../../stores/settings'
@@ -205,6 +207,9 @@ function resetAssistantSpeechSurface(source: string) {
 const { activeCard } = storeToRefs(useAiriCardStore())
 const speechStore = useSpeechStore()
 const { ssmlEnabled, activeSpeechProvider, activeSpeechModel, activeSpeechVoice, pitch } = storeToRefs(speechStore)
+// "语言模块" settings: which driver MMDScene should use for the mouth.
+const languageModuleStore = useLanguageModuleStore()
+const { mmdLipSyncMode } = storeToRefs(languageModuleStore)
 const activeCardId = computed(() => activeCard.value?.name ?? 'default')
 const speechRuntimeStore = useSpeechRuntimeStore()
 const { trackOfficialTtsAutoEnabled } = useAnalytics()
@@ -267,6 +272,27 @@ function toStageEmotionPayload(payload: { name: string, intensity: number }): Em
       return undefined
   }
 }
+
+// Discrete performance emotion. The backend pulls an [emotion:xxx] tag out of
+// the reply (cognitive_engine.py) and publishes agent.emotion.update, which
+// Go's WebGateway relays to us as an agent.emotion frame. Subscribing to the
+// bridge directly instead of watching the gateway store's single lastEmotion
+// ref keeps two emotions arriving in quick succession from overwriting each
+// other before Vue's watcher gets to run.
+//
+// The gateway reuses this same frame for its periodic mood broadcast, whose
+// value is an upper-case VAD tag ("HAPPY", "SLEEPY", ...). Discrete emotions
+// are always lower-case, so only the lower-case form counts as a gesture cue --
+// otherwise the mood tag would fire a motion on every single turn.
+chatHookCleanups.push(betterAgentWSBridge.onEmotion((emotion) => {
+  const name = typeof emotion === 'string' ? emotion.trim() : ''
+  if (!name || name !== name.toLowerCase())
+    return
+
+  const payload = toStageEmotionPayload({ name, intensity: 1 })
+  if (payload)
+    emotionsQueue.enqueue(payload)
+}))
 
 chatHookCleanups.push(streamingControl.onSignal(async (signal) => {
   if (signal.type === 'act') {
@@ -335,6 +361,9 @@ async function playFunction(item: Parameters<Parameters<typeof createPlaybackMan
   const source = audioContext.createBufferSource()
   currentAudioSource.value = source
   source.buffer = item.audio
+  // Frontend-TTS audio gets the same envelope timeline, so MMD audio mode is
+  // not limited to backend chunks.
+  appendAudioEnvelope(item.audio, audioContext.currentTime)
 
   source.connect(audioContext.destination)
   if (audioAnalyser.value)
@@ -424,10 +453,30 @@ const betterAgentActiveSources = new Set<AudioBufferSourceNode>()
 // MVP viseme-driven mouth shape: a rough discrete shape -> "how open"
 // mapping, tune after real-world visual testing.
 const BETTERAGENT_VISEME_OPENNESS: Record<string, number> = { aa: 1.0, oh: 0.8, ou: 0.5, ee: 0.4, ih: 0.3 }
-interface BetterAgentScheduledViseme { absTime: number, openness: number }
+interface BetterAgentScheduledViseme {
+  absTime: number
+  // Same moment expressed on the wall clock (performance.now()/1000). MMDScene
+  // consumes this instead of absTime because its lip-sync composable could end
+  // up on a different AudioContext instance than this component's (workspace
+  // package copies), which would make AudioContext-clock times incomparable.
+  wallTime: number
+  shape: string
+  openness: number
+}
 // Flat, time-ordered queue of upcoming viseme events across all currently
 // scheduled (but not yet fully played) chunks, in audioContext-clock time.
-let betterAgentVisemeSchedule: BetterAgentScheduledViseme[] = []
+// `const` on purpose: MMDScene receives this array as a prop and reads it from
+// its render loop, so sessions must be reset in place (`.length = 0`) instead
+// of by reassigning a fresh array.
+const betterAgentVisemeSchedule: BetterAgentScheduledViseme[] = []
+
+// Per-~50ms RMS frames of every scheduled audio buffer, on the wall clock.
+// MMD's audio lip-sync mode consumes this timeline directly: Web Audio
+// analyser graphs read pure silence in this environment (dead-end branches
+// are skipped by the browser), while this data is computed from the very
+// AudioBuffers we schedule, so it always matches what actually plays.
+interface BetterAgentEnvelopeFrame { wallTime: number, rms: number }
+const betterAgentAudioEnvelope: BetterAgentEnvelopeFrame[] = []
 
 // Typewriter caption reveal: one pending setTimeout per scheduled chunk,
 // firing at that chunk's real playback start time to append its
@@ -456,6 +505,8 @@ function stopBetterAgentAudio(_reason: string) {
     betterAgentSilenceTimer = undefined
   }
   for (const source of [...betterAgentActiveSources]) {
+    if (currentAudioSource.value === source)
+      currentAudioSource.value = undefined
     try {
       source.stop()
       source.disconnect()
@@ -464,12 +515,33 @@ function stopBetterAgentAudio(_reason: string) {
   }
   betterAgentActiveSources.clear()
   betterAgentNextChunkStartTime = 0
-  betterAgentVisemeSchedule = []
+  betterAgentVisemeSchedule.length = 0
+  betterAgentAudioEnvelope.length = 0
   for (const timer of betterAgentCaptionTimers)
     clearTimeout(timer)
   betterAgentCaptionTimers.clear()
   if (nowSpeaking.value)
     resetSpeakingState()
+}
+
+/**
+ * Computes ~50ms RMS frames for one scheduled buffer and appends them to the
+ * wall-clock envelope timeline. `startTime` is on the AudioContext clock, the
+ * same base the viseme schedule uses.
+ */
+function appendAudioEnvelope(buffer: AudioBuffer, startTime: number) {
+  const wallNow = performance.now() / 1000
+  const wallLead = startTime - audioContext.currentTime
+  const data = buffer.getChannelData(0)
+  const frame = Math.max(1, Math.floor(buffer.sampleRate * 0.05))
+  for (let i = 0; i < data.length; i += frame) {
+    const end = Math.min(i + frame, data.length)
+    let sum = 0
+    for (let j = i; j < end; j++)
+      sum += data[j] * data[j]
+    const rms = Math.sqrt(sum / (end - i))
+    betterAgentAudioEnvelope.push({ wallTime: wallNow + wallLead + i / buffer.sampleRate, rms })
+  }
 }
 
 async function playBetterAgentAudioChunk(audioBase64: string, generation: number, visemes?: Viseme[], textSegment?: string) {
@@ -510,6 +582,15 @@ async function playBetterAgentAudioChunk(audioBase64: string, generation: number
     source.connect(audioAnalyser.value)
   if (lipSyncNode.value)
     source.connect(lipSyncNode.value)
+  // MMDScene's formant fallback connects to this prop; the viseme timeline
+  // below drives the primary mouth path. Last scheduled chunk wins here,
+  // which is acceptable for the fallback because chunks are contiguous.
+  currentAudioSource.value = source
+  // Audio-driven lip-sync (语言模块) analyses the live mix: attach EVERY
+  // scheduled chunk, not just the prop's last one, or the analyser hears
+  // silence until the final chunk starts.
+  if (stageModelRenderer.value === 'mmd')
+    mmdSceneRef.value?.attachAudioSource?.(source)
 
   // Back-to-back scheduling: if the previous chunk's end time is still
   // ahead of us, start exactly there (gapless); otherwise (first chunk,
@@ -522,9 +603,20 @@ async function playBetterAgentAudioChunk(audioBase64: string, generation: number
     // chunks, and each chunk's own visemes are already ascending by
     // time_offset -- so appending here keeps the overall queue sorted
     // without needing an explicit sort.
+    const wallNow = performance.now() / 1000
+    const wallLead = startTime - audioContext.currentTime
     for (const v of visemes)
-      betterAgentVisemeSchedule.push({ absTime: startTime + v.time_offset, openness: BETTERAGENT_VISEME_OPENNESS[v.shape] ?? 0.5 })
+      betterAgentVisemeSchedule.push({
+        absTime: startTime + v.time_offset,
+        wallTime: wallNow + wallLead + v.time_offset,
+        shape: v.shape,
+        openness: BETTERAGENT_VISEME_OPENNESS[v.shape] ?? 0.5,
+      })
   }
+
+  // Envelope timeline for audio-driven lip-sync (runs regardless of whether
+  // this chunk carried visemes).
+  appendAudioEnvelope(audioBuffer, startTime)
 
   if (textSegment) {
     const delayMs = Math.max(0, (startTime - audioContext.currentTime) * 1000)
@@ -540,6 +632,8 @@ async function playBetterAgentAudioChunk(audioBase64: string, generation: number
   betterAgentActiveSources.add(source)
   source.onended = () => {
     betterAgentActiveSources.delete(source)
+    if (currentAudioSource.value === source)
+      currentAudioSource.value = undefined
     try {
       source.disconnect()
     }
@@ -590,14 +684,26 @@ function queueBetterAgentAudioChunk(audioBase64: string, visemes?: Viseme[], tex
 }
 
 if (typeof window !== 'undefined') {
+  // NOTICE:
+  // 同一页面任何时刻只允许一个 BetterAgent 音频订阅者。组件可能因路由往返、
+  // 设置页进出、或 Vite HMR 热更新而再次运行 setup；若旧订阅没被卸载清理，
+  // 同一帧音频会被两条播放链各自解码、各自排期一次 —— 听感就是"同一句语音
+  // 叠唱两遍"（两个声道几乎完全一致，只有毫秒级差异）。
+  // 修复方式：把清理函数挂到 window 上，新的 setup 先移除旧订阅（幂等）。
+  // 移除条件：仅当确认所有挂载路径都能保证 onUnmounted 必然执行后再考虑删除。
+  const bridgeWindow = window as any
+  bridgeWindow.__betterAgentAudioHookCleanup?.()
+  bridgeWindow.__betterAgentAudioHookCleanup = undefined
   betterAgentBridgePollId = setInterval(() => {
-    const bridge = (window as any).__betterAgentWSBridge
+    const bridge = bridgeWindow.__betterAgentWSBridge
     if (bridge) {
       clearInterval(betterAgentBridgePollId)
       betterAgentBridgePollId = undefined
-      betterAgentAudioUnsub = bridge.onAudioChunk((audioBase64: string, _sampleRate: number, _chatId?: number, visemes?: Viseme[], textSegment?: string) => {
+      const unsub = bridge.onAudioChunk((audioBase64: string, _sampleRate: number, _chatId?: number, visemes?: Viseme[], textSegment?: string) => {
         queueBetterAgentAudioChunk(audioBase64, visemes, textSegment)
       })
+      betterAgentAudioUnsub = unsub
+      bridgeWindow.__betterAgentAudioHookCleanup = unsub
       // eslint-disable-next-line no-console
       console.log('[BetterAgent] Hooked BetterAgent WS Bridge audio chunks to Stage gapless player!')
     }
@@ -1285,6 +1391,11 @@ onUnmounted(() => {
   if (betterAgentBridgePollId)
     clearInterval(betterAgentBridgePollId)
   betterAgentAudioUnsub?.()
+  if (typeof window !== 'undefined') {
+    const bridgeWindow = window as any
+    if (bridgeWindow.__betterAgentAudioHookCleanup === betterAgentAudioUnsub)
+      bridgeWindow.__betterAgentAudioHookCleanup = undefined
+  }
   stopBetterAgentAudio('unmount')
   // Tear down any in-flight TTS session (segmenter or streaming) and
   // drain playback. Without this, a still-open streaming ws keeps
@@ -1395,6 +1506,11 @@ defineExpose({
         :cursor-position="cursorPosition"
         :enable-orbit-controls="props.enableOrbitControls"
         :current-audio-source="currentAudioSource"
+        :viseme-schedule="betterAgentVisemeSchedule"
+        :audio-envelope="betterAgentAudioEnvelope"
+        :lip-sync-mode="mmdLipSyncMode"
+        :audio-context="audioContext"
+        :speaking="nowSpeaking"
         @error="console.error"
       />
       <div

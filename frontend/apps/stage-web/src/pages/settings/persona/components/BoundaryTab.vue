@@ -92,7 +92,7 @@ async function handleSave() {
           校园知识库 RAG 检索 (Campus KB)
         </div>
         <div class="text-xs text-neutral-400 mt-0.5">
-          开启后猫娘会自动检索校园 FAQ、图书馆与规章制度。
+          开启后角色会自动检索校园 FAQ、图书馆与规章制度。
         </div>
       </div>
       <label class="relative inline-flex cursor-pointer items-center">
@@ -110,7 +110,7 @@ async function handleSave() {
         v-model="knowledgeScope"
         rows="4"
         class="w-full resize-y rounded-xl border border-neutral-200 bg-neutral-50/50 p-4 text-sm font-mono text-neutral-900 transition-colors focus:border-primary-500 focus:outline-none dark:border-neutral-800 dark:bg-neutral-900/40 dark:text-neutral-100"
-        placeholder="限定猫娘擅长或了解的特定专业知识或对话范畴..."
+        placeholder="限定角色擅长或了解的特定专业知识或对话范畴..."
       />
     </div>
 
@@ -163,7 +163,7 @@ async function handleSave() {
         class="h-2 w-full cursor-pointer accent-primary-500"
       >
       <p class="text-xs text-neutral-400">
-        防止猫娘长篇大论，保持二次元伴侣聊天节奏。
+        防止角色长篇大论，保持自然的聊天节奏。
       </p>
     </div>
 

@@ -1,13 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { betterAgentWSBridge } from '../../services/betteragent-ws'
+import { betterAgentWSBridge, resolveStableChatId, toSubChatId } from '../../services/betteragent-ws'
 import { useChatStreamStore } from '../chat/stream-store'
 import { useChatSessionStore } from '../chat/session-store'
 import { useSpeechOutputControlStore } from '../speech-output-control'
 import { useSTS2GameStateStore } from './sts2-game-state'
-import { resolveStableChatId } from '../../services/betteragent-ws'
 
-import type { Citation, EmotionalStatePayload } from '../../services/betteragent-ws'
+import type { Citation, EmotionalStatePayload, LifeProposalPayload } from '../../services/betteragent-ws'
 
 export const useBetterAgentGatewayStore = defineStore('betteragent-gateway', () => {
   const currentChatId = ref<number | null>(null)
@@ -34,6 +33,21 @@ export const useBetterAgentGatewayStore = defineStore('betteragent-gateway', () 
   // replaced (not accumulated) each time a text_delta carries some, reset
   // to empty at the start of each new turn alongside revealedCaption.
   const citations = ref<Citation[]>([])
+  // 工具执行进度（Layer 4）。目前只有联网搜索会发 start/done，用于在搜索那
+  // 3~8 秒里显示"正在查阅资料…"的呼吸光提示。label 是后端按角色卡渲染好的
+  // 人设化文案（例如「正在翻手机查资料…」），前端原样显示，不自己拼词。
+  const toolActivity = ref<{ tool: string, label: string } | null>(null)
+  // 向着星写入确认框：lifeProposal 是当前弹窗展示的那条；lifeProposalQueue 是
+  // 排队等待确认的其余提议（同一轮可能生成多条，用户逐条确认）。pending 入队，
+  // 终态由弹窗展示结果后从队列里推出下一条。
+  const lifeProposal = ref<LifeProposalPayload | null>(null)
+  const lifeProposalQueue = ref<LifeProposalPayload[]>([])
+
+  function promoteNextLifeProposal() {
+    const [next, ...rest] = lifeProposalQueue.value
+    lifeProposalQueue.value = rest
+    lifeProposal.value = next ?? null
+  }
 
   const streamStore = useChatStreamStore()
   const chatSession = useChatSessionStore()
@@ -111,7 +125,16 @@ export const useBetterAgentGatewayStore = defineStore('betteragent-gateway', () 
     // active and msgChatId aren't guaranteed to be the same type (one may
     // come off a URL query param as a string) -- compare as numbers so a
     // type mismatch alone never causes a live chat_id to be filtered out.
-    return Number(active) === Number(msgChatId)
+    const activeNum = Number(active)
+    const msgNum = Number(msgChatId)
+    if (!Number.isFinite(activeNum) || !Number.isFinite(msgNum))
+      return true
+    // 关键：本地拿到的是**子 id**（URL / localStorage），而 Go 回传的每一帧
+    // payload.chat_id 是**折叠过**的 id（子 id + WebNamespaceOffset）。直接比会
+    // 永远不相等，于是 agent.tool_activity（联网搜索提示）、agent.state_change
+    // 这类「带 chat_id 的帧」会被这里全部丢掉——用户看到的就是"卡住、没有搜索
+    // 过程"。两边统一折回子 id 再比。
+    return toSubChatId(activeNum) === toSubChatId(msgNum)
   }
 
   let unsubs: Array<() => void> = []
@@ -143,6 +166,16 @@ export const useBetterAgentGatewayStore = defineStore('betteragent-gateway', () 
       if (!isChatMatch(chatId))
         return
 
+      // 只带 citations、不带文字的收尾帧：仅更新"她的消息来源"，绝不当作一句话。
+      // 它比最后几句的 TTS 回灌还早到（句子要等音频分块才 flush），若让它走进
+      // 下面那段"开流/收尾"的逻辑，就会凭空开一个空字幕、或提前 finalize 把尾句
+      // 甩到流外面。"回合结束"由 CSM 的 state_change 负责，不靠这条帧。
+      if (!text) {
+        if (msgCitations?.length)
+          citations.value = msgCitations
+        return
+      }
+
       touchStreamingWatchdog()
       if (!isStreaming.value) {
         isStreaming.value = true
@@ -160,6 +193,8 @@ export const useBetterAgentGatewayStore = defineStore('betteragent-gateway', () 
         isStreaming.value = false
         triggerGracePeriod()
         streamStore.finalizeStream()
+        // 兜底：搜完立刻撤掉提示，不等 done 事件（两者通常同时到）。
+        toolActivity.value = null
       }
     }))
 
@@ -182,6 +217,9 @@ export const useBetterAgentGatewayStore = defineStore('betteragent-gateway', () 
           graceTimer = null
         }
         resetStreamingWatchdog()
+        // 兜底：搜索中途被打断（barge-in / 取消）时 done 事件不会来，
+        // 否则提示会一直转下去。
+        toolActivity.value = null
         // The CSM reaches idle both on a normal turn end (reason
         // "tts_stream_end"/"text_fallback_idle", sent as soon as the server
         // is done producing/sending, not once the client has finished
@@ -212,9 +250,51 @@ export const useBetterAgentGatewayStore = defineStore('betteragent-gateway', () 
       emotionalState.value = state
     }))
 
+    // 5. Tool activity (Layer 4) -- persona-flavoured "looking it up" indicator
+    //    shown while a web search is in flight.
+    unsubs.push(betterAgentWSBridge.onToolActivity((activity) => {
+      if (!isChatMatch(activity.chat_id))
+        return
+      if (activity.phase === 'start')
+        toolActivity.value = { tool: activity.tool, label: activity.label || '' }
+      else
+        toolActivity.value = null
+    }))
+
     // 5. Game State
     unsubs.push(betterAgentWSBridge.onGameState((state) => {
       sts2GameState.updateState(state)
+    }))
+
+    // 5.5 向着星写入确认框：同一轮的多条提议进入队列，弹窗按顺序逐条确认
+    unsubs.push(betterAgentWSBridge.onLifeProposal((proposal) => {
+      if (!isChatMatch(proposal.chat_id))
+        return
+      const phase = proposal.phase
+
+      // 当前弹窗正在展示的那条：任何相位都就地更新（终态由弹窗展示结果）
+      if (lifeProposal.value?.proposal_id === proposal.proposal_id) {
+        lifeProposal.value = proposal
+        return
+      }
+
+      const index = lifeProposalQueue.value.findIndex(item => item.proposal_id === proposal.proposal_id)
+      if (index >= 0) {
+        const next = [...lifeProposalQueue.value]
+        if (phase === 'executing')
+          next[index] = proposal
+        else
+          next.splice(index, 1) // 还没轮到展示就收到终态（超时等）：直接出队
+        lifeProposalQueue.value = next
+        return
+      }
+
+      // 新提议：没在展示就排队（pending 才会到这一步）
+      if (!lifeProposal.value) {
+        lifeProposal.value = proposal
+        return
+      }
+      lifeProposalQueue.value = [...lifeProposalQueue.value, proposal]
     }))
 
     // 6. STT transcripts -- show the user's recognized voice input as a
@@ -257,6 +337,10 @@ export const useBetterAgentGatewayStore = defineStore('betteragent-gateway', () 
     partialTranscript,
     revealedCaption,
     citations,
+    toolActivity,
+    lifeProposal,
+    lifeProposalQueue,
+    promoteNextLifeProposal,
     scheduleDialogOpen,
     emotionDialogOpen,
     initialize,

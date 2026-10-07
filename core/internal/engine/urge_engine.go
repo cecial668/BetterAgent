@@ -29,6 +29,16 @@ type UrgeParams struct {
 	UnreadPressureWindow time.Duration
 	PrimaryChatID        int64
 	TargetSessionMaxAge  time.Duration
+
+	// 用户配置的主动策略（config.yaml 的 integration.tothestars.proactive，
+	// 即设置页「生活数据 → 主动提及策略」）：静默时段 + 频率上限。
+	// 频率上限按"实际开口次数"计（含无聊搭话与生活事件触发的主动），
+	// 0 = 不限制；静默时段可跨零点（如 23:00 → 07:00）。
+	QuietHoursEnabled   bool
+	QuietStartMinute    int
+	QuietEndMinute      int
+	MaxProactivePerHour int
+	MaxProactivePerDay  int
 }
 
 const defaultProactiveReason = "一段时间没有人跟你说话，你觉得有点无聊，想主动搭个话"
@@ -51,6 +61,9 @@ type UrgeEngine struct {
 	deadZoneUntil        time.Time
 	consecutiveUnreplied int
 	lastReason           string
+	// proactiveFireTimes 记录每次真正开口主动说话的时间戳，用于"每小时/每天
+	// 最多主动几次"的频率上限（见 integration.tothestars.proactive）。
+	proactiveFireTimes []time.Time
 
 	logger *zap.Logger
 }
@@ -131,6 +144,56 @@ func (u *UrgeEngine) OnTurnCompleted() {
 	}
 }
 
+// minuteOfDay converts a wall-clock time to minutes since midnight (0..1439).
+func minuteOfDay(t time.Time) int { return t.Hour()*60 + t.Minute() }
+
+// inQuietHours reports whether now falls inside the user-configured quiet
+// window. A start == end window is treated as "no quiet hours". Windows may
+// cross midnight (e.g. 23:00 -> 07:00), matching the settings page.
+func (u *UrgeEngine) inQuietHours(now time.Time) bool {
+	if !u.params.QuietHoursEnabled || u.params.QuietStartMinute == u.params.QuietEndMinute {
+		return false
+	}
+	start, end := u.params.QuietStartMinute, u.params.QuietEndMinute
+	current := minuteOfDay(now)
+	if start < end {
+		return current >= start && current < end
+	}
+	return current >= start || current < end
+}
+
+// withinFrequencyCaps prunes fire history older than 24h and reports whether
+// the configured hourly/daily proactive-message caps still allow a turn now.
+// 0 means unlimited; caps count actual proactive turns (boredom chatter and
+// life events alike), so any one channel can't exhaust the day's budget alone.
+func (u *UrgeEngine) withinFrequencyCaps(now time.Time) bool {
+	cutoff := now.Add(-24 * time.Hour)
+	kept := u.proactiveFireTimes[:0]
+	for _, firedAt := range u.proactiveFireTimes {
+		if firedAt.After(cutoff) {
+			kept = append(kept, firedAt)
+		}
+	}
+	u.proactiveFireTimes = kept
+
+	if u.params.MaxProactivePerDay > 0 && len(u.proactiveFireTimes) >= u.params.MaxProactivePerDay {
+		return false
+	}
+	if u.params.MaxProactivePerHour > 0 {
+		hourCutoff := now.Add(-time.Hour)
+		recent := 0
+		for _, firedAt := range u.proactiveFireTimes {
+			if firedAt.After(hourCutoff) {
+				recent++
+			}
+		}
+		if recent >= u.params.MaxProactivePerHour {
+			return false
+		}
+	}
+	return true
+}
+
 // EvaluateTick integrates one tick's worth of Urge and decides whether to
 // fire a proactive turn. Must be called after emotionalState.ApplyTimeDecay
 // and stateMachine.EvaluateTick so it reads post-decay mood and
@@ -185,6 +248,12 @@ func (u *UrgeEngine) EvaluateTick(
 		return false, ""
 	}
 
+	// 4.5 用户策略硬门：静默时段 × 频率上限（来自设置页；与心情、冷却、
+	// 状态机同为「与」关系，任何一个不允许就不开口）。
+	if u.inQuietHours(now) || !u.withinFrequencyCaps(now) {
+		return false, ""
+	}
+
 	// 5. Dynamic threshold from mood: high arousal lowers it (talks more),
 	// low energy raises it (talks less).
 	arousal, energy := 0.5, 0.5
@@ -221,6 +290,7 @@ func (u *UrgeEngine) EvaluateTick(
 	u.gameEventEnergy = 0
 	u.lastReason = ""
 	u.consecutiveUnreplied++
+	u.proactiveFireTimes = append(u.proactiveFireTimes, now)
 	u.logger.Info("UrgeEngine proactive turn triggered",
 		zap.Int("consecutive_unreplied", u.consecutiveUnreplied),
 		zap.String("reason", reason),

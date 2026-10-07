@@ -59,6 +59,9 @@ DB_PATH = Path(os.getenv("ADMIN_DB_PATH", BACKEND_DIR / "admin.db"))
 ADMIN_PORT = int(os.getenv("ADMIN_PORT", "8094"))
 CAMPUS_KB_URL = os.getenv("CAMPUS_KB_URL", "http://127.0.0.1:8093").rstrip("/")
 COMPANION_URL = os.getenv("COMPANION_URL", "http://127.0.0.1:8096").rstrip("/")
+# 向着星（ToTheStars 个人生活管理应用）。舞台「生活概览 HUD」经本代理读取，
+# 避免 stage-web(5173) -> 向着星(8765) 的跨域问题（同 COMPANION_URL 模式）。
+TOTHESTARS_URL = os.getenv("TOTHESTARS_URL", "http://127.0.0.1:8765").rstrip("/")
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333").rstrip("/")
@@ -79,6 +82,7 @@ PERSONA_ALLOWED_FIELDS = frozenset({
     "knowledge_scope",
     "forbidden_topics",
     "tts",
+    "web_search",
 })
 
 # tts 是嵌套对象，只放开这几个 GPT-SoVITS 每次合成都会重新读取 persona YAML
@@ -89,6 +93,16 @@ TTS_PATCHABLE_FIELDS = frozenset({
     "prompt_text",
     "prompt_lang",
     "text_lang",
+})
+
+# web_search（Layer 2 角色卡联网字段）也是嵌套对象。enabled 是这里唯一允许的
+# 布尔子字段 —— 上面"大多数字段是 string"的假设不能套在它身上，否则从设置页
+# 关掉人设联网会被 400 拒掉。
+WEB_SEARCH_PATCHABLE_FIELDS = frozenset({"enabled", "style", "alias", "missed", "searching", "framing"})
+
+# 与 shared/web_search_persona.py 的 STYLE_PRESETS 保持一致（改一处要改两处）。
+WEB_SEARCH_ALLOWED_STYLES = frozenset({
+    "neutral", "phone", "divination", "library", "informant", "oracle", "custom",
 })
 
 # 会话历史 key 候选（契约文本为 short_term:{chat_id}，现有代码使用
@@ -230,6 +244,28 @@ def _read_persona(persona_id: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else {}
 
 
+def _default_user_name() -> str:
+    """角色该怎么称呼用户 —— 由 config/config.yaml 的 `persona.default_user_name` 决定。
+
+    本模块刻意不 import shared/（admin 面板要保持独立），所以直接读 YAML。
+    读不到就退回中性的「你」，绝不退回「主人」——那是内置猫娘人设的遗留值。
+    """
+    config_path = REPO_ROOT / "config" / "config.yaml"
+    try:
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                doc = _yaml_safe.load(f)
+            if isinstance(doc, dict):
+                persona_sec = doc.get("persona")
+                if isinstance(persona_sec, dict):
+                    name = str(persona_sec.get("default_user_name") or "").strip()
+                    if name:
+                        return name
+    except Exception:
+        pass
+    return "你"
+
+
 def _get_active_persona_id() -> str:
     config_path = REPO_ROOT / "config" / "config.yaml"
     if config_path.exists():
@@ -364,6 +400,20 @@ async def patch_persona(persona_id: str, payload: Optional[Dict[str, Any]] = Bod
                     return _error(400, f"Forbidden tts field: {sub_field}")
                 if not isinstance(sub_value, str):
                     return _error(400, f"Field 'tts.{sub_field}' must be a string")
+        elif field == "web_search":
+            if not isinstance(value, dict):
+                return _error(400, "Field 'web_search' must be an object")
+            for sub_field, sub_value in value.items():
+                if sub_field not in WEB_SEARCH_PATCHABLE_FIELDS:
+                    return _error(400, f"Forbidden web_search field: {sub_field}")
+                if sub_field == "enabled":
+                    if not isinstance(sub_value, bool):
+                        return _error(400, "Field 'web_search.enabled' must be a boolean")
+                    continue
+                if not isinstance(sub_value, str):
+                    return _error(400, f"Field 'web_search.{sub_field}' must be a string")
+                if sub_field == "style" and sub_value.strip().lower() not in WEB_SEARCH_ALLOWED_STYLES:
+                    return _error(400, f"Unknown web_search style: {sub_value}")
         elif not isinstance(value, str):
             return _error(400, f"Field '{field}' must be a string")
 
@@ -386,6 +436,12 @@ async def patch_persona(persona_id: str, payload: Optional[Dict[str, Any]] = Bod
                 if not isinstance(doc.get("tts"), dict):
                     doc["tts"] = {}
                 doc["tts"].update(value)
+            elif field == "web_search":
+                # 同上：只合并前端发来的子字段，避免把 style/alias 等
+                # 本次没提交的字段整段抹掉。
+                if not isinstance(doc.get("web_search"), dict):
+                    doc["web_search"] = {}
+                doc["web_search"].update(value)
             else:
                 doc[field] = value
 
@@ -496,9 +552,6 @@ def delete_persona(persona_id: str):
     path = _persona_path(persona_id)
     if path is None or not path.exists():
         return _error(404, "not found")
-
-    if persona_id == "catgirl":
-        return _error(400, "Cannot delete default persona 'catgirl'")
 
     if persona_id == _get_active_persona_id():
         return _error(400, f"Cannot delete currently active persona '{persona_id}'")
@@ -705,7 +758,7 @@ def _load_companion_user_facts() -> Dict[int, Dict[str, Any]]:
             if uid not in facts_map:
                 facts_map[uid] = {
                     "user_id": uid,
-                    "display_name": "主人" if uid in (1, 1001) else f"用户{uid}",
+                    "display_name": _default_user_name() if uid in (1, 1001) else f"用户{uid}",
                     "known_facts": [],
                     "last_seen": r["created_at"],
                 }
@@ -1398,6 +1451,43 @@ async def delete_schedule(schedule_id: str):
 
 
 # ---------------------------------------------------------------------------
+# 向着星（ToTheStars）反向代理：舞台「生活概览 HUD」的数据来源。
+# HUD 是用户自己看自己的数据，因此不在这里重复权限判断；权限约束的是
+# 数字人（认知服务侧的工具门控），两份职责互不重叠。
+# ---------------------------------------------------------------------------
+@app.get("/api/admin/tothestars/snapshot")
+async def tothestars_snapshot(
+    date: Optional[str] = Query(None),
+    include_journal_text: bool = Query(False),
+):
+    """今日生活快照（透传 GET /api/agent/snapshot；date 省略为今天）。"""
+    params: List[str] = []
+    if date:
+        params.append(f"date={date}")
+    if include_journal_text:
+        params.append("include_journal_text=true")
+    path = "/api/agent/snapshot" + (f"?{'&'.join(params)}" if params else "")
+    return await _forward(TOTHESTARS_URL, "tothestars", "GET", path)
+
+
+@app.get("/api/admin/tothestars/audit")
+async def tothestars_audit(limit: int = Query(50), actor: Optional[str] = Query(None)):
+    """AI 操作流水（透传 GET /api/agent/audit）。"""
+    params = [f"limit={max(1, min(int(limit), 500))}"]
+    if actor:
+        params.append(f"actor={actor}")
+    return await _forward(TOTHESTARS_URL, "tothestars", "GET", f"/api/agent/audit?{'&'.join(params)}")
+
+
+@app.post("/api/admin/tothestars/audit/{audit_id}/undo")
+async def tothestars_audit_undo(audit_id: int):
+    """撤销一条审计记录（透传 POST /api/agent/audit/{id}/undo）。"""
+    return await _forward(
+        TOTHESTARS_URL, "tothestars", "POST", f"/api/agent/audit/{int(audit_id)}/undo"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 2.7 系统配置与 API 密钥管理 (BYOK 模式)
 # ---------------------------------------------------------------------------
 # 用户不应直接修改仓库根目录的 config/config.yaml 或 .env；API Key / 默认
@@ -1440,6 +1530,10 @@ def _atomic_write_text(path: Path, content: str) -> None:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
+            # newline="\n": 无论跑在哪个平台上都写 LF。仓库 .gitattributes 是
+            # eol=lf，若交给 Windows 默认的换行翻译，从设置页存一次 Key 就会把整份
+            # .env 改成 CRLF，产生一份纯粹是噪音的 diff。
+            newline="\n",
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
@@ -1560,6 +1654,9 @@ def _write_config_rt(doc: Any) -> None:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
+            # 理由同 _atomic_write_text：config.yaml 在磁盘上是 LF，存一次设置就被
+            # 改成 CRLF 会让每次保存都变成"整份文件都动了"的假 diff。
+            newline="\n",
             dir=CONFIG_PATH.parent,
             prefix=".config.yaml.",
             suffix=".tmp",
@@ -1657,6 +1754,175 @@ async def _publish_persona_update(persona_id: str, patch: Dict[str, Any]) -> boo
     return await _nats_publish(PERSONA_UPDATE_SUBJECT, {"persona_id": persona_id, **patch})
 
 
+# 联网搜索（tools.web_search）的默认值，与 config/config.yaml.example 保持一致。
+WEB_SEARCH_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "provider": "tavily",
+    "api_key_env": "TAVILY_API_KEY",
+    "top_k": 5,
+    "timeout_seconds": 15,
+    "max_calls_per_turn": 1,
+}
+
+# 面板允许写入搜索服务 Key 的环境变量名白名单：避免把任意 env 名写进 .env。
+WEB_SEARCH_ALLOWED_ENV_NAMES = frozenset({"TAVILY_API_KEY"})
+
+# 面板当前只支持 tavily 一家搜索服务。
+WEB_SEARCH_ALLOWED_PROVIDERS = frozenset({"tavily"})
+
+# 面板可写回的数值字段及其合法区间（最小值, 最大值）。
+WEB_SEARCH_NUMERIC_FIELDS = {
+    "top_k": (1, 20),
+    "timeout_seconds": (1, 120),
+    "max_calls_per_turn": (1, 5),
+}
+
+# ---------------------------------------------------------------------------
+# 向着星联动（integration.tothestars）的默认值与校验白名单，与
+# shared/life_data_permissions.py / config/config.yaml.example 保持一致。
+# ---------------------------------------------------------------------------
+TOTHESTARS_PERMISSION_CATEGORIES = (
+    "commissions", "schedule", "legends", "wallet", "journal", "journal_text", "focus",
+)
+
+# 四档权限：可读可写可主动 / 可读不可写可主动 / 问起才读 / 完全不可见。
+TOTHESTARS_ALLOWED_TIERS = frozenset({
+    "read_write_proactive", "read_only", "on_request", "hidden",
+})
+
+TOTHESTARS_DEFAULT_PERMISSIONS: Dict[str, str] = {
+    "commissions": "read_write_proactive",
+    "schedule": "read_write_proactive",
+    "legends": "read_only",
+    "wallet": "read_only",
+    "journal": "on_request",
+    "journal_text": "hidden",
+    "focus": "read_write_proactive",
+}
+
+TOTHESTARS_DEFAULT_ENDPOINT = "http://127.0.0.1:8765"
+
+# 写入通道：local=在 BetterAgent 进程内直接调用向着星服务层写它自己的 SQLite
+# （同机推荐，向着星离线也能写）；remote=HTTP + 失败暂存重试。
+TOTHESTARS_ALLOWED_WRITE_MODES = frozenset({"local", "remote"})
+TOTHESTARS_DEFAULT_WRITE_MODE = "local"
+# 本机默认路径（用户要求预填；换机器时在设置页改）。
+TOTHESTARS_DEFAULT_LOCAL_ROOT = r"E:\ToTheStars\ToTheStarsV26-6-1\ToTheStarsWeb_react_frontend_full\ToTheStarsWeb\ToTheStarsWeb"
+
+TOTHESTARS_PROACTIVE_NUMERIC_LIMITS = {
+    "max_per_hour": (0, 24),
+    "max_per_day": (0, 96),
+}
+
+TOTHESTARS_DEFAULT_PROACTIVE: Dict[str, Any] = {
+    "enabled": False,
+    "quiet_hours": ["23:00", "07:00"],
+    "max_per_hour": 2,
+    "max_per_day": 6,
+}
+
+_TOTHESTARS_QUIET_HOUR_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _tothestars_quiet_hours(value: Any) -> List[str]:
+    """归一化静默时段；非法值整体回落到默认，绝不让坏数据进前端。"""
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(item, str) and _TOTHESTARS_QUIET_HOUR_RE.match(item) for item in value)
+    ):
+        return [value[0], value[1]]
+    return list(TOTHESTARS_DEFAULT_PROACTIVE["quiet_hours"])
+
+
+
+def _web_search_env_name(cfg: Dict[str, Any]) -> str:
+    """解析存放搜索 Key 的环境变量名，只接受白名单内取值。"""
+    raw = _get_dotted(cfg, "tools.web_search.api_key_env")
+    if isinstance(raw, str) and raw.strip() in WEB_SEARCH_ALLOWED_ENV_NAMES:
+        return raw.strip()
+    return WEB_SEARCH_DEFAULTS["api_key_env"]
+
+
+def _web_search_key(cfg: Dict[str, Any]) -> str:
+    """搜索服务 Key：根目录 .env 优先，os.environ 兜底。"""
+    env_name = _web_search_env_name(cfg)
+    value = _read_env(ENV_PATH).get(env_name) or os.getenv(env_name, "")
+    if not value or value.startswith("your_"):
+        return ""
+    return value
+
+
+def _web_search_payload(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """脱敏后的联网搜索配置，供前端开关读写。
+
+    key_set 是给前端判断"开关打开了但还没填 Key"用的 —— 那种状态下 cognitive
+    服务会按不可用处理（见 shared/web_search_config.py），UI 应该如实提示，
+    否则用户会以为联网已经能用。
+    """
+    key = _web_search_key(cfg)
+    return {
+        "enabled": bool(_get_dotted(cfg, "tools.web_search.enabled", WEB_SEARCH_DEFAULTS["enabled"])),
+        "provider": _get_dotted(cfg, "tools.web_search.provider", WEB_SEARCH_DEFAULTS["provider"]),
+        "api_key_env": _web_search_env_name(cfg),
+        "top_k": _get_dotted(cfg, "tools.web_search.top_k", WEB_SEARCH_DEFAULTS["top_k"]),
+        "timeout_seconds": _get_dotted(
+            cfg, "tools.web_search.timeout_seconds", WEB_SEARCH_DEFAULTS["timeout_seconds"]
+        ),
+        "max_calls_per_turn": _get_dotted(
+            cfg, "tools.web_search.max_calls_per_turn", WEB_SEARCH_DEFAULTS["max_calls_per_turn"]
+        ),
+        "key_masked": _mask_key(key),
+        "key_set": bool(key),
+    }
+
+
+def _tothestars_payload(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """当前向着星联动配置（权限矩阵 + 主动策略），缺省即产品的默认最小权限。"""
+    permissions: Dict[str, str] = {}
+    for category in TOTHESTARS_PERMISSION_CATEGORIES:
+        raw = _get_dotted(cfg, f"integration.tothestars.permissions.{category}")
+        permissions[category] = (
+            raw if raw in TOTHESTARS_ALLOWED_TIERS else TOTHESTARS_DEFAULT_PERMISSIONS[category]
+        )
+
+    quiet_raw = _get_dotted(
+        cfg, "integration.tothestars.proactive.quiet_hours",
+        TOTHESTARS_DEFAULT_PROACTIVE["quiet_hours"],
+    )
+    return {
+        "enabled": bool(_get_dotted(cfg, "integration.tothestars.enabled", False)),
+        "endpoint": _get_dotted(
+            cfg, "integration.tothestars.endpoint", TOTHESTARS_DEFAULT_ENDPOINT,
+        ),
+        "timeout_seconds": _get_dotted(cfg, "integration.tothestars.timeout_seconds", 2.0),
+        "permissions": permissions,
+        "write_mode": (
+            raw_mode if (raw_mode := _get_dotted(cfg, "integration.tothestars.write_mode", TOTHESTARS_DEFAULT_WRITE_MODE))
+            in TOTHESTARS_ALLOWED_WRITE_MODES
+            else TOTHESTARS_DEFAULT_WRITE_MODE
+        ),
+        "local_project_root": str(
+            _get_dotted(cfg, "integration.tothestars.local_project_root", TOTHESTARS_DEFAULT_LOCAL_ROOT) or ""
+        ),
+        "proactive": {
+            "enabled": bool(_get_dotted(
+                cfg, "integration.tothestars.proactive.enabled",
+                TOTHESTARS_DEFAULT_PROACTIVE["enabled"],
+            )),
+            "quiet_hours": _tothestars_quiet_hours(quiet_raw),
+            "max_per_hour": _get_dotted(
+                cfg, "integration.tothestars.proactive.max_per_hour",
+                TOTHESTARS_DEFAULT_PROACTIVE["max_per_hour"],
+            ),
+            "max_per_day": _get_dotted(
+                cfg, "integration.tothestars.proactive.max_per_day",
+                TOTHESTARS_DEFAULT_PROACTIVE["max_per_day"],
+            ),
+        },
+    }
+
+
 @app.get("/api/admin/config")
 def get_admin_config():
     """2.7 GET: 返回默认 Provider、网络代理与各 Provider 脱敏 key 状态。"""
@@ -1683,6 +1949,8 @@ def get_admin_config():
             "https_proxy": network.get("https_proxy", ""),
         },
         "providers": providers,
+        "web_search": _web_search_payload(cfg),
+        "tothestars": _tothestars_payload(cfg),
     }
 
 
@@ -1693,7 +1961,7 @@ async def patch_admin_config(payload: Optional[Dict[str, Any]] = Body(None)):
     if not payload:
         return _error(400, "empty body")
 
-    allowed_fields = {"default_provider", "network", "providers"}
+    allowed_fields = {"default_provider", "network", "providers", "web_search", "tothestars"}
     for field in payload:
         if field not in allowed_fields:
             return _error(400, f"Forbidden field: {field}")
@@ -1728,6 +1996,101 @@ async def patch_admin_config(payload: Optional[Dict[str, Any]] = Body(None)):
                 if not isinstance(update[key], str):
                     return _error(400, f"providers.{name}.{key} must be a string")
 
+    web_search = payload.get("web_search")
+    if web_search is not None:
+        if not isinstance(web_search, dict):
+            return _error(400, "web_search must be an object")
+        for key in web_search:
+            if key not in ("enabled", "provider", "api_key", *WEB_SEARCH_NUMERIC_FIELDS):
+                return _error(400, f"Forbidden web_search field: {key}")
+        if "enabled" in web_search and not isinstance(web_search["enabled"], bool):
+            return _error(400, "web_search.enabled must be a boolean")
+        if "provider" in web_search and web_search["provider"] not in WEB_SEARCH_ALLOWED_PROVIDERS:
+            return _error(400, f"Unknown web_search provider: {web_search['provider']}")
+        if "api_key" in web_search and not isinstance(web_search["api_key"], str):
+            return _error(400, "web_search.api_key must be a string")
+        for numeric_field, (minimum, maximum) in WEB_SEARCH_NUMERIC_FIELDS.items():
+            if numeric_field not in web_search:
+                continue
+            value = web_search[numeric_field]
+            # bool 是 int 的子类，要单独挡掉，否则 true 会被当作 1 写进配置。
+            if isinstance(value, bool) or not isinstance(value, int):
+                return _error(400, f"web_search.{numeric_field} must be an integer")
+            if not minimum <= value <= maximum:
+                return _error(
+                    400,
+                    f"web_search.{numeric_field} must be between {minimum} and {maximum}",
+                )
+
+    tothestars = payload.get("tothestars")
+    if tothestars is not None:
+        if not isinstance(tothestars, dict):
+            return _error(400, "tothestars must be an object")
+        for key in tothestars:
+            if key not in (
+                "enabled", "endpoint", "timeout_seconds", "permissions", "proactive",
+                "write_mode", "local_project_root",
+            ):
+                return _error(400, f"Forbidden tothestars field: {key}")
+        if "enabled" in tothestars and not isinstance(tothestars["enabled"], bool):
+            return _error(400, "tothestars.enabled must be a boolean")
+        if "write_mode" in tothestars and tothestars["write_mode"] not in TOTHESTARS_ALLOWED_WRITE_MODES:
+            return _error(400, "tothestars.write_mode must be 'local' or 'remote'")
+        if "local_project_root" in tothestars:
+            root = tothestars["local_project_root"]
+            if not isinstance(root, str) or len(root) > 512:
+                return _error(400, "tothestars.local_project_root must be a path string (<=512 chars)")
+            if ".." in root:
+                return _error(400, "tothestars.local_project_root must not contain '..'")
+        if "endpoint" in tothestars:
+            endpoint = tothestars["endpoint"]
+            if not isinstance(endpoint, str) or not endpoint.startswith(("http://", "https://")):
+                return _error(400, "tothestars.endpoint must be an http(s) URL string")
+        if "timeout_seconds" in tothestars:
+            timeout = tothestars["timeout_seconds"]
+            # bool 是 int 的子类，必须单独挡掉。
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0.2 <= float(timeout) <= 30:
+                return _error(400, "tothestars.timeout_seconds must be between 0.2 and 30")
+
+        permissions = tothestars.get("permissions")
+        if permissions is not None:
+            if not isinstance(permissions, dict):
+                return _error(400, "tothestars.permissions must be an object")
+            for category, tier in permissions.items():
+                if category not in TOTHESTARS_PERMISSION_CATEGORIES:
+                    return _error(400, f"Unknown tothestars permission category: {category}")
+                if tier not in TOTHESTARS_ALLOWED_TIERS:
+                    return _error(400, f"Unknown tothestars permission tier: {tier}")
+
+        proactive = tothestars.get("proactive")
+        if proactive is not None:
+            if not isinstance(proactive, dict):
+                return _error(400, "tothestars.proactive must be an object")
+            for key in proactive:
+                if key not in ("enabled", "quiet_hours", *TOTHESTARS_PROACTIVE_NUMERIC_LIMITS):
+                    return _error(400, f"Forbidden tothestars.proactive field: {key}")
+            if "enabled" in proactive and not isinstance(proactive["enabled"], bool):
+                return _error(400, "tothestars.proactive.enabled must be a boolean")
+            if "quiet_hours" in proactive:
+                quiet = proactive["quiet_hours"]
+                if not (
+                    isinstance(quiet, list)
+                    and len(quiet) == 2
+                    and all(isinstance(item, str) and _TOTHESTARS_QUIET_HOUR_RE.match(item) for item in quiet)
+                ):
+                    return _error(400, "tothestars.proactive.quiet_hours must be two HH:MM strings")
+            for numeric_field, (minimum, maximum) in TOTHESTARS_PROACTIVE_NUMERIC_LIMITS.items():
+                if numeric_field not in proactive:
+                    continue
+                value = proactive[numeric_field]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    return _error(400, f"tothestars.proactive.{numeric_field} must be an integer")
+                if not minimum <= value <= maximum:
+                    return _error(
+                        400,
+                        f"tothestars.proactive.{numeric_field} must be between {minimum} and {maximum}",
+                    )
+
     # 2) 先写 .env（密钥是更关键的状态）
     if providers:
         env_updates = {
@@ -1741,6 +2104,15 @@ async def patch_admin_config(payload: Optional[Dict[str, Any]] = Body(None)):
             except Exception as exc:
                 logger.error(f"Failed to write .env: {exc}")
                 return _error(500, "failed to update .env")
+
+    # 搜索服务 Key 与 LLM Provider Key 分开写：它的环境变量名来自配置
+    # （tools.web_search.api_key_env，白名单内取值），不写死在 PROVIDER_DEFS 里。
+    if web_search is not None and "api_key" in web_search:
+        try:
+            _upsert_env({_web_search_env_name(_read_config(safe=True)): web_search["api_key"]})
+        except Exception as exc:
+            logger.error(f"Failed to write web_search key to .env: {exc}")
+            return _error(500, "failed to update .env")
 
     # 3) 再写 config.yaml（ruamel round-trip 保留注释与字段顺序）
     try:
@@ -1757,6 +2129,35 @@ async def patch_admin_config(payload: Optional[Dict[str, Any]] = Body(None)):
             for name, update in providers.items():
                 if isinstance(update, dict) and "model" in update:
                     llm.setdefault(name, {})["model"] = update["model"]
+        if web_search is not None:
+            tools = doc.get("tools")
+            if not isinstance(tools, dict):
+                tools = {}
+                doc["tools"] = tools
+            section = tools.get("web_search")
+            if not isinstance(section, dict):
+                section = {}
+                tools["web_search"] = section
+            # api_key 不落进 config.yaml，它只住在 .env 里（见上面的 _upsert_env）。
+            for key in ("enabled", "provider", *WEB_SEARCH_NUMERIC_FIELDS):
+                if key in web_search:
+                    section[key] = web_search[key]
+        if tothestars is not None:
+            integration = doc.setdefault("integration", {})
+            section = integration.setdefault("tothestars", {})
+            for key in ("enabled", "endpoint", "timeout_seconds"):
+                if key in tothestars:
+                    section[key] = tothestars[key]
+            # permissions / proactive 都是"按子键合并"，不整段覆盖 —— 前端可以
+            # 只提交一个类目的权限，其余保持原值。
+            if isinstance(tothestars.get("permissions"), dict):
+                perms = section.setdefault("permissions", {})
+                for category, tier in tothestars["permissions"].items():
+                    perms[category] = tier
+            if isinstance(tothestars.get("proactive"), dict):
+                proactive = section.setdefault("proactive", {})
+                for key, value in tothestars["proactive"].items():
+                    proactive[key] = value
         _write_config_rt(doc)
     except Exception as exc:
         logger.error(f"Failed to write config.yaml: {exc}")
@@ -1769,6 +2170,8 @@ async def patch_admin_config(payload: Optional[Dict[str, Any]] = Body(None)):
             "default_provider": default_provider,
             "network": network,
             "providers": providers,
+            "web_search": web_search,
+            "tothestars": tothestars,
         })
     except Exception as exc:
         logger.warning(f"Config reload publish failed: {exc}")

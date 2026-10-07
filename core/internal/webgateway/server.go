@@ -34,6 +34,7 @@ type Server struct {
 	urgeEngine          *engine.UrgeEngine
 	autonomousPlayState *engine.AutonomousPlayState
 	gameEventToken      string
+	lifeEventToken      string
 	gameEventBindAddr   string
 	gameEventWeights    GameEventWeights
 	logger              *zap.Logger
@@ -53,6 +54,7 @@ func NewServer(
 	urgeEngine *engine.UrgeEngine,
 	autonomousPlayState *engine.AutonomousPlayState,
 	gameEventToken string,
+	lifeEventToken string,
 	gameEventBindAddr string,
 	gameEventWeights GameEventWeights,
 	logger *zap.Logger,
@@ -69,6 +71,7 @@ func NewServer(
 		urgeEngine:          urgeEngine,
 		autonomousPlayState: autonomousPlayState,
 		gameEventToken:      gameEventToken,
+		lifeEventToken:      lifeEventToken,
 		gameEventBindAddr:   gameEventBindAddr,
 		gameEventWeights:    gameEventWeights,
 		logger:              logger,
@@ -78,6 +81,14 @@ func NewServer(
 func (s *Server) SetEmotionStore(store *emotion.EmotionalStateStore) {
 	if s.bridge != nil {
 		s.bridge.SetEmotionStore(store)
+	}
+}
+
+// SetFocusManager wires the focus-mode/pomodoro timer owner into the gateway
+// (command subscription + state broadcasts + completion trigger).
+func (s *Server) SetFocusManager(focus *engine.FocusManager) {
+	if s.bridge != nil {
+		s.bridge.SetFocusManager(focus)
 	}
 }
 
@@ -109,6 +120,7 @@ func (s *Server) Start() error {
 	if s.gameEventBindAddr != "" {
 		gameEventMux := http.NewServeMux()
 		gameEventMux.HandleFunc("/api/game-event", s.handleGameEvent)
+		gameEventMux.HandleFunc("/api/life-event", s.handleLifeEvent)
 		gameEventMux.HandleFunc("/api/game-turn", s.handleGameTurn)
 		gameEventMux.HandleFunc("/api/game-state", s.handleGameState)
 

@@ -203,7 +203,9 @@ watch(() => [consciousnessProvider.value, visionProvider.value, speechProvider.v
   }
   if (spProvider) {
     await speechStore.loadVoicesForProvider(spProvider)
-    const metadata = providersStore.getProviderMetadata(spProvider)
+    // findProviderMetadata（非抛出型）：卡片里可能残留后端/已删除的 provider
+    // 名（如 gpt_sovits），这里不能再让 getProviderMetadata 把整页打崩。
+    const metadata = providersStore.findProviderMetadata(spProvider)
     if (metadata?.capabilities.listModels) {
       await providersStore.fetchModelsForProvider(spProvider)
     }
@@ -231,7 +233,7 @@ watch(selectedVisionProvider, async (newProvider, oldProvider) => {
 watch(selectedSpeechProvider, async (newProvider, oldProvider) => {
   if (oldProvider !== undefined && newProvider !== oldProvider && newProvider) {
     await speechStore.loadVoicesForProvider(newProvider)
-    const metadata = providersStore.getProviderMetadata(newProvider)
+    const metadata = providersStore.findProviderMetadata(newProvider)
     if (metadata?.capabilities.listModels) {
       await providersStore.fetchModelsForProvider(newProvider)
     }

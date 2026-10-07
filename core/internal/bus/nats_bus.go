@@ -43,6 +43,21 @@ const (
 	SubjectStreamCancelAck   = "agent.stream.cancel_ack"
 	SubjectStreamStateChange = "agent.stream.state_change"
 
+	// SubjectToolActivity carries tool-execution progress (currently only
+	// web_search) so the browser can show a "looking it up..." indicator while a
+	// search is in flight -- see webgateway's handleToolActivityMsg. It is NOT a
+	// CSM state: the indicator must appear mid-turn, while the state machine is
+	// already sitting in STREAMING_TTS waiting for the next sentence.
+	SubjectToolActivity = "agent.tool.activity"
+
+	// SubjectLifeProposal carries 向着星 write-proposal confirmation-box events
+	// (pending/executing/executed/failed/cancelled/expired) from the Python
+	// cognitive engine to the browser -- see webgateway's
+	// handleLifeProposalMsg. The user's decision travels back as a normal
+	// user.text sentinel through the existing inbound pipeline, so no extra
+	// subject is needed for that direction.
+	SubjectLifeProposal = "agent.life.proposal"
+
 	// SubjectGameEvent carries external game events (e.g. Slay the Spike 2
 	// C# mod hook) into the bus for observability/future consumers. The
 	// UrgeEngine side effect happens in-process in the HTTP handler, not via
@@ -56,6 +71,21 @@ const (
 	// handleScheduleFiredMsg), instead of the fixed-template message the
 	// companion service used to publish directly.
 	SubjectScheduleFired = "agent.schedule.fired"
+
+	// SubjectFocusCommand carries focus-mode/pomodoro commands
+	// (start/pause/resume/end) from the Python cognitive engine to Go's
+	// FocusManager, which owns the authoritative timer. SubjectFocusState
+	// broadcasts the resulting per-chat snapshot back (the cognitive engine
+	// caches it for prompt injection; browsers get the same payload as an
+	// agent.focus_state WS frame).
+	SubjectFocusCommand = "agent.focus.command"
+	SubjectFocusState   = "agent.focus.state"
+
+	// SubjectNotice carries lightweight UI notices (queued 向着星 write
+	// delivered / given up). They never touch the LLM or TTS: WebGateway just
+	// broadcasts them as an agent.notice WS frame so the browser can show a
+	// low-priority toast.
+	SubjectNotice = "agent.notice"
 )
 
 // ActionDecisionSubject and ActionDecisionWildcard replace the old flat

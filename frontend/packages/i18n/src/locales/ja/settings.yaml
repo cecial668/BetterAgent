@@ -1726,6 +1726,21 @@ mmd:
     remove: Remove motion
     description: >-
       Import VMD motion files, set one as the looping idle, or play any as a one-shot gesture. Map emotions to motions to play gestures alongside facial expressions.
+  emotions:
+    title: Emotion Gestures
+    description: >-
+      When the backend sends an emotion, play the motion mapped here once, then
+      return to the idle motion. Leave a row as (not set) to skip its gesture.
+    none: (not set)
+    happy: Happy / Proud
+    sad: Downcast
+    angry: Angry
+    think: Thinking
+    surprised: Surprised
+    awkward: Awkward / Shy
+    question: Questioning
+    curious: Curious
+    neutral: Neutral
   morphs:
     title: Morphs
     auto: (auto)

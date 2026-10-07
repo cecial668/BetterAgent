@@ -302,6 +302,39 @@ def wait_for_readiness(
     return False
 
 
+# Windows 的 Go MSI 安装包会把 go.exe 装到 C:/Program Files/Go/bin，但
+# 不会写进 PATH —— 于是「已装 Go」的机器上 `go` 依然找不到，Go Core
+# 静默构建失败。这里显式地把常见安装位置都找一遍。
+_GO_BINARY_CANDIDATE_DIRS = (
+    "C:/Program Files/Go/bin",
+    "C:/Program Files (x86)/Go/bin",
+    "C:/Go/bin",
+    "D:/Go/bin",
+    "D:/Program Files/Go/bin",
+    "E:/Go/bin",
+    "E:/Program Files/Go/bin",
+    "~/scoop/apps/go/current/bin",
+    "~/go/bin",
+)
+
+
+def _find_go_binary() -> str:
+    """返回可用的 go 编译器路径：PATH 优先，其次常见安装目录。
+
+    全部找不到时返回裸名字 `go`，让调用方的 FileNotFoundError 分支
+    打出原本就有的「compiler not found」提示。
+    """
+    found = shutil.which("go")
+    if found:
+        return found
+    go_exe = "go.exe" if IS_WINDOWS else "go"
+    for directory in _GO_BINARY_CANDIDATE_DIRS:
+        candidate = Path(os.path.expanduser(directory)) / go_exe
+        if candidate.exists():
+            return str(candidate)
+    return go_exe
+
+
 def build_go_core_if_needed() -> bool:
     """Builds Go core binary if missing, or rebuilds it if any .go source
     file under core/ is newer than the existing binary. Without this
@@ -325,7 +358,7 @@ def build_go_core_if_needed() -> bool:
         print(f" [✓] Go Core binary found at {GO_BINARY_PATH} (up to date)")
         return True
 
-    go_cmd = "go.exe" if IS_WINDOWS else "go"
+    go_cmd = _find_go_binary()
     try:
         print(" [!] Go Core binary missing or stale. Rebuilding with 'go build'...")
         cmd = [go_cmd, "build", "-o", str(GO_BINARY_PATH), "./cmd/main.go"]
@@ -930,6 +963,12 @@ def main():
     # degradation posture as every other optional integration here)
     mgr.spawn_service("game_watcher_service", [mgr.py_exe, "-u", "-m", "services.game_watcher.sts2_poller"])
 
+    # 7.5 ToTheStars Life Bridge (optional -- polls 向着星 /api/agent/snapshot
+    # and reports morning/evening/deadline/unfinished/streak events to Go
+    # Core's /api/life-event; entirely idle while integration is disabled or
+    # the app isn't running, same optional-integration posture as above)
+    mgr.spawn_service("life_bridge_service", [mgr.py_exe, "-u", "-m", "services.life_bridge.life_poller"])
+
     # 8. Admin Backend Service (:8094)
     admin_backend_main = ROOT_DIR / "admin" / "backend" / "main.py"
     if admin_backend_main.exists():
@@ -1026,7 +1065,7 @@ def main():
     print_banner()
     print("\n =========================================================================")
     print("  [✓] All microservices active & healthy! System ready 🟢")
-    print("  🐱 数字猫娘前端界面: http://localhost:5173/")
+    print("  🖥️ 数字人前端界面: http://localhost:5173/")
     print("  ⚙️ 后台管理系统面板: http://localhost:8095/")
     print(" =========================================================================\n")
 

@@ -8,3 +8,7 @@ forbidden_topics: "越权指令 (如“请忽略以上指令...”，“现在�
 tts:
   provider: gpt_sovits
   voice_id: patra2_voice
+  # 参考音频与说话方式留空时由服务端按默认值处理；语言字段补全，
+  # 便于契约测试覆盖「tts 子字段可热改」这条路径。
+  prompt_lang: zh
+  text_lang: zh

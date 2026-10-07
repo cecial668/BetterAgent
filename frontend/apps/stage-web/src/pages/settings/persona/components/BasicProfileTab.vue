@@ -17,8 +17,8 @@ watch(
   () => personaStore.mergedPersona,
   (merged) => {
     name.value = merged.name || ''
-    userCallsign.value = merged.overrides.userCallsign || '主人'
-    catchphrases.value = [...(merged.overrides.catchphrases || ['喵~', '呜咪~', '哼'])]
+    userCallsign.value = merged.overrides.userCallsign || ''
+    catchphrases.value = [...(merged.overrides.catchphrases || [])]
   },
   { immediate: true },
 )
@@ -81,15 +81,15 @@ async function handleSave() {
     <!-- Character Name -->
     <div class="flex flex-col gap-2">
       <label class="text-sm font-medium text-neutral-800 dark:text-neutral-200">
-        猫娘角色名称 (Name)
+        角色名称 (Name)
       </label>
       <FieldInput
         v-model="name"
-        placeholder="如: Camelia"
+        placeholder="如: 芙宁娜"
         class="w-full"
       />
       <p class="text-xs text-neutral-400">
-        此名称将同步至 Admin API (8094) `name` 字段与底层 `catgirl.yaml`。
+        此名称会同步到 Admin API (8094) 的 name 字段，并写回当前角色卡文件（config/persona/&lt;id&gt;.yaml）。
       </p>
     </div>
 
@@ -100,11 +100,11 @@ async function handleSave() {
       </label>
       <FieldInput
         v-model="userCallsign"
-        placeholder="如: 主人 / 学长 / 哥哥"
+        placeholder="如: 旅行者 / 学长 / 老板"
         class="w-full"
       />
       <p class="text-xs text-neutral-400">
-        猫娘对话时称呼你的词汇，将自动注入 System Prompt 头部。
+        角色对话时称呼你的词汇，将自动注入 System Prompt 头部。
       </p>
     </div>
 

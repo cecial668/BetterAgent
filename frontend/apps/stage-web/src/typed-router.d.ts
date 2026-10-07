@@ -314,9 +314,30 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
+    '/settings/modules/greeting': RouteRecordInfo<
+      '/settings/modules/greeting',
+      '/settings/modules/greeting',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
     '/settings/modules/hearing': RouteRecordInfo<
       '/settings/modules/hearing',
       '/settings/modules/hearing',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
+    '/settings/modules/language': RouteRecordInfo<
+      '/settings/modules/language',
+      '/settings/modules/language',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
+    '/settings/modules/life-data': RouteRecordInfo<
+      '/settings/modules/life-data',
+      '/settings/modules/life-data',
       Record<never, never>,
       Record<never, never>,
       | never
@@ -741,6 +762,13 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
+    '/settings/web-search/': RouteRecordInfo<
+      '/settings/web-search/',
+      '/settings/web-search',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
     '/v2/': RouteRecordInfo<
       '/v2/',
       '/v2',
@@ -1055,9 +1083,27 @@ declare module 'vue-router/auto-routes' {
       views:
         | never
     }
+    '../../packages/stage-pages/src/pages/settings/modules/greeting.vue': {
+      routes:
+        | '/settings/modules/greeting'
+      views:
+        | never
+    }
     '../../packages/stage-pages/src/pages/settings/modules/hearing.vue': {
       routes:
         | '/settings/modules/hearing'
+      views:
+        | never
+    }
+    '../../packages/stage-pages/src/pages/settings/modules/language.vue': {
+      routes:
+        | '/settings/modules/language'
+      views:
+        | never
+    }
+    '../../packages/stage-pages/src/pages/settings/modules/life-data.vue': {
+      routes:
+        | '/settings/modules/life-data'
       views:
         | never
     }
@@ -1418,6 +1464,12 @@ declare module 'vue-router/auto-routes' {
     '../../packages/stage-pages/src/pages/settings/system/general.vue': {
       routes:
         | '/settings/system/general'
+      views:
+        | never
+    }
+    '../../packages/stage-pages/src/pages/settings/web-search/index.vue': {
+      routes:
+        | '/settings/web-search/'
       views:
         | never
     }

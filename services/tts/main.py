@@ -20,8 +20,8 @@ from shared.schema.payloads import StreamAudioChunkPayload, ActionDecisionPayloa
 from shared.logger import setup_logger
 from shared.text_utils import clean_tts_text
 from services.tts.cosyvoice_client import CosyVoiceClient
-from services.tts.viseme_generator import text_to_visemes, allocate_viseme_text_slice, VisemeRateEstimator
-from services.tts.audio_normalizer import add_wav_header, smooth_pcm_chunk_edges
+from services.tts.viseme_generator import text_to_visemes
+from services.tts.audio_normalizer import add_wav_header
 
 load_dotenv()
 logger = setup_logger("tts_service")
@@ -38,10 +38,10 @@ from shared.persona_loader import PersonaLoader
 from services.tts.gpt_sovits_client import GPTSoVITSClient
 from services.tts.cosyvoice_client import CosyVoiceClient
 
-# Process-lifetime, per-provider viseme pacing estimate -- see
-# VisemeRateEstimator's docstring. Not persisted across restarts; re-seeds
-# from the conservative default and re-calibrates within a few utterances.
-_viseme_rate_estimator = VisemeRateEstimator()
+# Outgoing publish slice length. The sentence is fully buffered first so the
+# viseme timeline can be laid out over its TRUE duration; ~200ms keeps caption
+# reveal granularity fine while keeping the browser's scheduled-node count low.
+PUBLISH_CHUNK_SECONDS = 0.2
 
 
 async def get_tts_client():
@@ -130,13 +130,15 @@ async def main():
                 return
 
             client = await get_tts_client()
-            provider_key = client.__class__.__name__
-            viseme_rate = _viseme_rate_estimator.get(provider_key)
             logger.info(f"🎙️ Synthesizing TTS audio ({client.__class__.__name__}) for sentence: '{text[:20]}' (chat_id={chat_id}, gen_id={gen_id})")
 
-            chunk_idx = 0
-            accumulated_pcm = bytearray()
-            remaining_viseme_text = text
+            # --- Phase 1: collect the sentence's full PCM --------------------
+            # Whole-sentence viseme timing needs the utterance's TRUE total
+            # duration, which is only known once synthesis completes. The
+            # client already delivers the sentence in ~200ms transport chunks
+            # and GPT-SoVITS synthesizes faster than real time, so buffering
+            # here costs no perceptible extra first-audio latency.
+            pcm = bytearray()
             tts_interrupted = False
             async for audio_bytes, fmt in client.synthesize_stream(text, cancel_event=cancel_event):
                 if cancel_event.is_set():
@@ -150,35 +152,80 @@ async def main():
                     tts_interrupted = True
                     break
 
-                # Collect raw PCM (strip WAV header if present) for debug dumping
+                # Collect raw PCM (strip WAV header if present)
                 raw_pcm = audio_bytes[44:] if (fmt == "wav" and len(audio_bytes) > 44 and audio_bytes[:4] == b"RIFF") else audio_bytes
-                accumulated_pcm.extend(raw_pcm)
+                pcm.extend(raw_pcm)
 
-                bytes_per_sec = float(getattr(client, "sample_rate", 32000) * 2)
-                duration_sec = len(raw_pcm) / bytes_per_sec
-                # Only pass this sub-chunk's own slice of the sentence, not
-                # the whole sentence -- see allocate_viseme_text_slice's
-                # docstring for why using the full sentence text on every
-                # sub-chunk produces meaningless, garbled viseme timing.
-                chunk_viseme_text, remaining_viseme_text = allocate_viseme_text_slice(
-                    remaining_viseme_text, duration_sec, chars_per_sec=viseme_rate
-                )
-                visemes = text_to_visemes(chunk_viseme_text, duration_sec)
+            if tts_interrupted:
+                return
+            if not pcm:
+                logger.warning(f"⚠️ TTS produced no audio for sentence '{text[:15]}...' (chat_id={chat_id})")
+                return
+            if gen_id < active_generations.get(chat_id, 0):
+                logger.warn(f"🛡️ GPU Gate: Dropped fully-buffered stale sentence for chat_id={chat_id} (stale gen_id={gen_id})")
+                return
 
-                # Wrap raw PCM chunks with 44-byte standard RIFF WAV header for browser AudioContext compatibility
-                sample_rate = getattr(client, "sample_rate", 32000)
-                smoothed_pcm = smooth_pcm_chunk_edges(raw_pcm, sample_rate=sample_rate, fade_ms=3.0)
-                out_bytes = add_wav_header(smoothed_pcm, sample_rate=sample_rate)
-                out_format = "wav"
+            sample_rate = getattr(client, "sample_rate", 32000)
+            bytes_per_sec = float(sample_rate * 2)
+            total_duration_sec = len(pcm) / bytes_per_sec
+
+            # --- Phase 2: one viseme timeline over the real total duration ---
+            # Every character's mouth shape is placed at its true proportion of
+            # the utterance. The old per-chunk allocation guessed each chunk's
+            # share from an estimated chars/sec rate, which drifted: near the
+            # end of a sentence the text could run out early and the mouth
+            # froze on the last shape (the "张着嘴不动" artifact).
+            full_visemes = text_to_visemes(text, total_duration_sec)
+
+            # --- Phase 3: publish fixed ~200ms slices ------------------------
+            chunk_bytes = max(2, int(bytes_per_sec * PUBLISH_CHUNK_SECONDS))
+            total_bytes = len(pcm)
+            raw_pos = 0
+            chunk_idx = 0
+            for start_byte in range(0, total_bytes, chunk_bytes):
+                if cancel_event.is_set():
+                    logger.info(f"⚡ TTS publish interrupted for chat_id={chat_id}")
+                    break
+                if gen_id < active_generations.get(chat_id, 0):
+                    logger.info(f"🛡️ GPU Gate: Dropped mid-publish TTS slice for chat_id={chat_id} (stale gen_id={gen_id})")
+                    break
+
+                slice_pcm = bytes(pcm[start_byte:start_byte + chunk_bytes])
+                chunk_start_sec = start_byte / bytes_per_sec
+                chunk_end_sec = (start_byte + len(slice_pcm)) / bytes_per_sec
+
+                visemes = [
+                    {**v, "time_offset": round(v["time_offset"] - chunk_start_sec, 3)}
+                    for v in full_visemes
+                    if chunk_start_sec <= v["time_offset"] < chunk_end_sec
+                ]
+
+                # Typewriter caption slice, proportional to this chunk's share
+                # of the timeline; the last chunk soaks up any rounding rest.
+                if start_byte + chunk_bytes >= total_bytes:
+                    target_pos = len(text)
+                else:
+                    target_pos = round(len(text) * chunk_end_sec / total_duration_sec)
+                    target_pos = max(raw_pos, min(target_pos, len(text)))
+                text_delta = text[raw_pos:target_pos]
+                raw_pos = target_pos
+
+                # Wrap raw PCM slices with a 44-byte RIFF WAV header for
+                # browser AudioContext compatibility.
+                # NOTICE:
+                # Do NOT apply smooth_pcm_chunk_edges() per slice here. The
+                # browser schedules these WAV slices back-to-back on the
+                # AudioContext clock, so their samples are already sample-
+                # contiguous; a per-slice 3ms fade-out+fade-in inserted a
+                # ~6ms amplitude notch every ~200ms, heard as a periodic
+                # stutter/gating artifact ("一卡一卡").
+                # Root cause: fades were a leftover band-aid for boundaries
+                # that are actually seamless with gapless scheduling.
+                # Removal condition: only reintroduce if a real pop/click is
+                # observed at a specific boundary AND confirmed by listening.
+                out_bytes = add_wav_header(slice_pcm, sample_rate=sample_rate)
 
                 audio_b64 = base64.b64encode(out_bytes).decode("utf-8")
-                # This chunk's own slice of the sentence (same value already
-                # computed above for viseme timing) -- lets the frontend pace
-                # a typewriter-style caption reveal against real chunk
-                # playback time, instead of the old "whole sentence, only on
-                # chunk_idx==0" value which carried no per-chunk timing info.
-                text_delta = chunk_viseme_text
-                is_sentence_start = (chunk_idx == 0)
                 chunk_payload = StreamAudioChunkPayload(
                     event_id=act.event_id,
                     source_component="tts_service",
@@ -186,10 +233,10 @@ async def main():
                     generation_id=gen_id,
                     audio_base64=audio_b64,
                     sample_rate=sample_rate,
-                    format=out_format,
+                    format="wav",
                     visemes=visemes,
                     text_delta=text_delta,
-                    is_sentence_start=is_sentence_start,
+                    is_sentence_start=(chunk_idx == 0),
                 )
 
                 envelope = {
@@ -200,31 +247,20 @@ async def main():
                 }
                 await nc.publish(SUBJECT_AUDIO_CHUNK, json.dumps(envelope).encode())
                 chunk_idx += 1
-                logger.debug(f"Published TTS Audio Chunk #{chunk_idx} ({len(audio_bytes)} bytes, {len(visemes)} visemes) for chat_id={chat_id}")
+                logger.debug(f"Published TTS Audio Chunk #{chunk_idx} ({len(slice_pcm)} bytes, {len(visemes)} visemes) for chat_id={chat_id}")
 
             if chunk_idx > 0:
-                logger.info(f"✅ Completed TTS Audio Synthesis for sentence '{text[:15]}...' ({chunk_idx} chunks) for chat_id={chat_id}")
-                if not tts_interrupted and accumulated_pcm:
-                    # Only calibrate off a *completed* utterance -- an
-                    # interrupted one's real duration doesn't correspond to
-                    # its full text length and would skew the estimate.
-                    bytes_per_sec = float(getattr(client, "sample_rate", 32000) * 2)
-                    total_duration_sec = len(accumulated_pcm) / bytes_per_sec
-                    _viseme_rate_estimator.observe(provider_key, len(text), total_duration_sec)
-                if accumulated_pcm:
-                    try:
-                        debug_dir = os.path.join("temp", "tts", "debug")
-                        os.makedirs(debug_dir, exist_ok=True)
-                        ts = int(time.time() * 1000)
-                        debug_filename = f"tts_{ts}_{chat_id}.wav"
-                        debug_path = os.path.join(debug_dir, debug_filename)
-                        sr = getattr(client, "sample_rate", 32000)
-                        full_wav = add_wav_header(bytes(accumulated_pcm), sample_rate=sr)
-                        with open(debug_path, "wb") as f:
-                            f.write(full_wav)
-                        logger.info(f"💾 Saved TTS debug audio to {debug_path}")
-                    except Exception as debug_err:
-                        logger.debug(f"Failed to save debug TTS audio: {debug_err}")
+                logger.info(f"✅ Completed TTS Audio Synthesis for sentence '{text[:15]}...' ({chunk_idx} chunks, {total_duration_sec:.1f}s) for chat_id={chat_id}")
+                try:
+                    debug_dir = os.path.join("temp", "tts", "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    ts = int(time.time() * 1000)
+                    debug_path = os.path.join(debug_dir, f"tts_{ts}_{chat_id}.wav")
+                    with open(debug_path, "wb") as f:
+                        f.write(add_wav_header(bytes(pcm), sample_rate=sample_rate))
+                    logger.info(f"💾 Saved TTS debug audio to {debug_path}")
+                except Exception as debug_err:
+                    logger.debug(f"Failed to save debug TTS audio: {debug_err}")
 
         except asyncio.CancelledError:
             logger.info(f"⚡ TTS synthesis task for chat_id={chat_id} caught CancelledError & exited cleanly.")

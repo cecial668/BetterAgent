@@ -355,3 +355,110 @@ func TestUrgeEngine_UnrepliedBackoffDecreasesFrequency(t *testing.T) {
 		t.Fatalf("expected proactive turn to fire at normal threshold after user activity reset")
 	}
 }
+
+// --- 用户主动策略：静默时段 × 频率上限（integration.tothestars.proactive） ---
+
+func fireTestParams() UrgeParams {
+	params := testUrgeParams()
+	// 让任意一次 60s tick 必定越过阈值：隔离"是否允许开口"与"攒了多少冲动"。
+	params.BaseThreshold = 0.0001
+	params.MinThreshold = 0.0001
+	params.CooldownDuration = 0
+	params.DeadZoneDuration = 0
+	return params
+}
+
+func TestUrgeEngine_QuietHoursSuppressFiring(t *testing.T) {
+	params := fireTestParams()
+	params.QuietHoursEnabled = true
+	params.QuietStartMinute = 23 * 60
+	params.QuietEndMinute = 7 * 60
+
+	emo := neutralEmotion()
+	personality := emotion.DefaultPersonality()
+
+	quiet := NewUrgeEngine(params, zap.NewNop())
+	if fired, _ := quiet.EvaluateTick(
+		time.Date(2026, 9, 12, 23, 30, 0, 0, time.Local), time.Minute, emo, personality, false, StateIdle, 0,
+	); fired {
+		t.Errorf("expected no proactive turn inside quiet hours (23:30)")
+	}
+	if fired, _ := quiet.EvaluateTick(
+		time.Date(2026, 9, 13, 6, 59, 0, 0, time.Local), time.Minute, emo, personality, false, StateIdle, 0,
+	); fired {
+		t.Errorf("expected no proactive turn just before quiet hours end (06:59)")
+	}
+
+	daytime := NewUrgeEngine(params, zap.NewNop())
+	if fired, _ := daytime.EvaluateTick(
+		time.Date(2026, 9, 13, 7, 0, 0, 0, time.Local), time.Minute, emo, personality, false, StateIdle, 0,
+	); !fired {
+		t.Errorf("expected proactive turn right after quiet hours end (07:00)")
+	}
+}
+
+func TestUrgeEngine_HourlyCapLimitsProactiveTurns(t *testing.T) {
+	params := fireTestParams()
+	params.MaxProactivePerHour = 1
+	params.MaxProactivePerDay = 0 // 不限制每天
+
+	u := NewUrgeEngine(params, zap.NewNop())
+	emo := neutralEmotion()
+	personality := emotion.DefaultPersonality()
+	base := time.Date(2026, 9, 12, 10, 0, 0, 0, time.Local)
+
+	if fired, _ := u.EvaluateTick(base, time.Minute, emo, personality, false, StateIdle, 0); !fired {
+		t.Fatalf("expected first proactive turn to fire")
+	}
+	if fired, _ := u.EvaluateTick(base.Add(10*time.Minute), time.Minute, emo, personality, false, StateIdle, 0); fired {
+		t.Errorf("expected hourly cap to block a second turn within the same hour")
+	}
+	if fired, _ := u.EvaluateTick(base.Add(2*time.Hour), time.Minute, emo, personality, false, StateIdle, 0); !fired {
+		t.Errorf("expected proactive turn to fire again after the hour window passed")
+	}
+}
+
+func TestUrgeEngine_DailyCapLimitsProactiveTurns(t *testing.T) {
+	params := fireTestParams()
+	params.MaxProactivePerHour = 0 // 不限制每小时
+	params.MaxProactivePerDay = 2
+
+	u := NewUrgeEngine(params, zap.NewNop())
+	emo := neutralEmotion()
+	personality := emotion.DefaultPersonality()
+	base := time.Date(2026, 9, 12, 9, 0, 0, 0, time.Local)
+
+	if fired, _ := u.EvaluateTick(base, time.Minute, emo, personality, false, StateIdle, 0); !fired {
+		t.Fatalf("expected 1st turn of the day to fire")
+	}
+	if fired, _ := u.EvaluateTick(base.Add(time.Hour), time.Minute, emo, personality, false, StateIdle, 0); !fired {
+		t.Fatalf("expected 2nd turn of the day to fire")
+	}
+	if fired, _ := u.EvaluateTick(base.Add(2*time.Hour), time.Minute, emo, personality, false, StateIdle, 0); fired {
+		t.Errorf("expected daily cap (2) to block a third turn")
+	}
+	if fired, _ := u.EvaluateTick(base.Add(25*time.Hour), time.Minute, emo, personality, false, StateIdle, 0); !fired {
+		t.Errorf("expected fire history older than 24h to be pruned so a new day can speak again")
+	}
+}
+
+func TestUrgeEngine_QuietHoursCrossMidnightAndNonCrossingWindows(t *testing.T) {
+	emo := neutralEmotion()
+	personality := emotion.DefaultPersonality()
+
+	crossing := fireTestParams()
+	crossing.QuietHoursEnabled = true
+	crossing.QuietStartMinute = 13 * 60
+	crossing.QuietEndMinute = 15 * 60
+	u := NewUrgeEngine(crossing, zap.NewNop())
+	if fired, _ := u.EvaluateTick(
+		time.Date(2026, 9, 12, 14, 0, 0, 0, time.Local), time.Minute, emo, personality, false, StateIdle, 0,
+	); fired {
+		t.Errorf("expected no firing inside a same-day quiet window (14:00)")
+	}
+	if fired, _ := u.EvaluateTick(
+		time.Date(2026, 9, 12, 15, 0, 0, 0, time.Local), time.Minute, emo, personality, false, StateIdle, 0,
+	); !fired {
+		t.Errorf("expected firing once the same-day quiet window ends (15:00)")
+	}
+}

@@ -7,9 +7,44 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { client } from '../composables/api'
+import { BUILTIN_FURINA_CHARACTER_ID, buildBuiltinFurinaCharacter } from '../constants/builtin-characters'
 import { charactersModel as model } from '../models/characters'
 import { charactersService as service } from '../services/characters'
 import { useAuthStore } from './auth'
+
+/** 被用户删除过的内置角色卡 id（localStorage），避免删掉后又自动长回来。 */
+const DISMISSED_BUILTINS_KEY = 'ba-builtin-characters-dismissed'
+
+function loadDismissedBuiltins(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DISMISSED_BUILTINS_KEY) || '[]')
+    return Array.isArray(raw) ? raw.filter(item => typeof item === 'string') : []
+  }
+  catch {
+    return []
+  }
+}
+
+function markBuiltinDismissed(id: string) {
+  try {
+    const current = loadDismissedBuiltins()
+    if (!current.includes(id))
+      localStorage.setItem(DISMISSED_BUILTINS_KEY, JSON.stringify([...current, id]))
+  }
+  catch {}
+}
+
+/** 首次拉取前把内置角色卡写入本地存储（已删除的不再重建）。 */
+async function ensureBuiltinCharacters() {
+  const dismissed = new Set(loadDismissedBuiltins())
+  const cached = await model.list()
+  const existing = new Set(cached.map(item => item.id))
+  for (const card of [buildBuiltinFurinaCharacter()]) {
+    if (dismissed.has(card.id) || existing.has(card.id))
+      continue
+    await model.upsert(card)
+  }
+}
 
 interface StoreQuery<TData> {
   error: Ref<Error | null>
@@ -275,7 +310,7 @@ export const useCharacterStore = defineStore('characters', () => {
     mutation: async (id: string) => service.bookmarkRemote(client, id),
   })
 
-  return createCharacterStoreController({
+  const controller = createCharacterStoreController({
     auth,
     bookmarkMutation,
     characters,
@@ -288,4 +323,26 @@ export const useCharacterStore = defineStore('characters', () => {
     service,
     updateMutation,
   })
+
+  async function fetchListWithBuiltins(all: boolean = false) {
+    try {
+      await ensureBuiltinCharacters()
+    }
+    catch (err) {
+      console.warn('[characters] 内置角色卡写入失败（继续用本地缓存）:', err)
+    }
+    return controller.fetchList(all)
+  }
+
+  async function removeWithBuiltinBookkeeping(id: string) {
+    if (id === BUILTIN_FURINA_CHARACTER_ID || id.startsWith('builtin-'))
+      markBuiltinDismissed(id)
+    return controller.remove(id)
+  }
+
+  return {
+    ...controller,
+    fetchList: fetchListWithBuiltins,
+    remove: removeWithBuiltinBookkeeping,
+  }
 })

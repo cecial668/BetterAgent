@@ -107,14 +107,14 @@ class TestAdminPanel:
         r = requests.get(f"{ADMIN_BASE}/api/admin/personas", timeout=5, headers=ADMIN_HEADERS)
         assert r.status_code == 200
         ids = [p["id"] for p in r.json()["personas"]]
-        assert "catgirl" in ids
-        assert "patra" in ids
+        assert "blank" in ids
+        assert "furina" in ids
 
     def test_get_persona_detail_shape(self):
-        r = requests.get(f"{ADMIN_BASE}/api/admin/personas/catgirl", timeout=5, headers=ADMIN_HEADERS)
+        r = requests.get(f"{ADMIN_BASE}/api/admin/personas/patra2", timeout=5, headers=ADMIN_HEADERS)
         assert r.status_code == 200
         body = r.json()
-        assert body["id"] == "catgirl"
+        assert body["id"] == "patra2"
         assert "name" in body
         assert "base_prompt" in body
 
@@ -125,18 +125,18 @@ class TestAdminPanel:
     def test_patch_persona_allowed_field(self):
         # 备份原始 name
         original = requests.get(
-            f"{ADMIN_BASE}/api/admin/personas/catgirl", timeout=5, headers=ADMIN_HEADERS).json()["name"]
+            f"{ADMIN_BASE}/api/admin/personas/patra2", timeout=5, headers=ADMIN_HEADERS).json()["name"]
         # 修改
-        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/catgirl",
+        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/patra2",
                            json={"name": "__contract_test__"}, timeout=5, headers=ADMIN_HEADERS)
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "ok"
         # 验证实际写入
         updated = requests.get(
-            f"{ADMIN_BASE}/api/admin/personas/catgirl", timeout=5, headers=ADMIN_HEADERS).json()["name"]
+            f"{ADMIN_BASE}/api/admin/personas/patra2", timeout=5, headers=ADMIN_HEADERS).json()["name"]
         assert updated == "__contract_test__"
         # 恢复
-        requests.patch(f"{ADMIN_BASE}/api/admin/personas/catgirl",
+        requests.patch(f"{ADMIN_BASE}/api/admin/personas/patra2",
                        json={"name": original}, timeout=5, headers=ADMIN_HEADERS)
 
     def test_patch_persona_tts_allowed_subfield(self):
@@ -145,13 +145,13 @@ class TestAdminPanel:
         # for real; provider/voice_id are read once at TTS service startup
         # and stay forbidden (see next test).
         original = requests.get(
-            f"{ADMIN_BASE}/api/admin/personas/catgirl", timeout=5, headers=ADMIN_HEADERS).json()["tts"]["prompt_lang"]
-        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/catgirl",
+            f"{ADMIN_BASE}/api/admin/personas/patra2", timeout=5, headers=ADMIN_HEADERS).json()["tts"]["prompt_lang"]
+        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/patra2",
                            json={"tts": {"prompt_lang": "__contract_test__"}}, timeout=5, headers=ADMIN_HEADERS)
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "ok"
         updated = requests.get(
-            f"{ADMIN_BASE}/api/admin/personas/catgirl", timeout=5, headers=ADMIN_HEADERS).json()["tts"]
+            f"{ADMIN_BASE}/api/admin/personas/patra2", timeout=5, headers=ADMIN_HEADERS).json()["tts"]
         assert updated["prompt_lang"] == "__contract_test__"
         # A partial tts patch must merge into the existing object, not
         # replace it -- provider/voice_id (and every other untouched
@@ -159,7 +159,7 @@ class TestAdminPanel:
         assert "provider" in updated
         assert "voice_id" in updated
         # 恢复
-        requests.patch(f"{ADMIN_BASE}/api/admin/personas/catgirl",
+        requests.patch(f"{ADMIN_BASE}/api/admin/personas/patra2",
                        json={"tts": {"prompt_lang": original}}, timeout=5, headers=ADMIN_HEADERS)
 
     def test_patch_persona_forbidden_tts_provider(self):
@@ -167,19 +167,19 @@ class TestAdminPanel:
         # in memory -- allowing them through PATCH would silently do nothing
         # (or worse, look like it worked) without a service restart, so
         # they're rejected rather than accepted-but-ineffective.
-        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/catgirl",
+        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/patra2",
                            json={"tts": {"provider": "evil"}}, timeout=5, headers=ADMIN_HEADERS)
         assert r.status_code == 400
         assert "error" in r.json()
 
     def test_patch_persona_forbidden_tts_not_an_object(self):
-        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/catgirl",
+        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/patra2",
                            json={"tts": "not-an-object"}, timeout=5, headers=ADMIN_HEADERS)
         assert r.status_code == 400
         assert "error" in r.json()
 
     def test_patch_persona_forbidden_id(self):
-        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/catgirl",
+        r = requests.patch(f"{ADMIN_BASE}/api/admin/personas/patra2",
                            json={"id": "hacked"}, timeout=5, headers=ADMIN_HEADERS)
         assert r.status_code == 400
 

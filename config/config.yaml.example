@@ -9,8 +9,13 @@ app:
 
 # Persona & Character Definition
 persona:
-  name: "Camelia"
-  appearance: "a cute anime catgirl with long silver hair, amber golden eyes, fluffy cat ears and tail, wearing a cozy oversized white hoodie with pink paw prints"
+  # 启用哪个人设（对应 config/persona/<id>.yaml，仓库自带 blank / furina 等）。
+  active: "furina"
+  # 角色该怎么称呼你。留空则角色直接称呼「你」。
+  default_user_name: "旅行者"
+  # 下面这几个字段只在人设 YAML 缺少对应字段时作为兜底，保持中性即可。
+  name: ""
+  appearance: ""
   art_style: "anime"
   reference_images_dir: "config/reference_images"
 
@@ -25,6 +30,48 @@ infrastructure:
   nats_url: "nats://127.0.0.1:4222"
   redis_url: "redis://127.0.0.1:6379"
   qdrant_url: "http://127.0.0.1:6333"
+
+# 外部联动：向着星（ToTheStars，个人生活管理应用，独立运行在 :8765）。
+# 设计文档：docs/TOTHESTARS-INTEGRATION-PLAN.md（权限模型 / 写入确认 / 审计撤销 / 主动策略）。
+# 权限四档（每类数据独立配置，设置页可改，改完写回这里）：
+#   read_write_proactive  可读、可写、可主动提及（默认：委托、日程）
+#   read_only             可读、不可写、可主动提及（默认：传说任务、点数）
+#   on_request            仅用户明确问起才可读，不主动提（默认：日记摘要）
+#   hidden                完全不可见：工具不进模型可见的工具表，提示词也不注入（默认：日记正文）
+# 默认最小权限；配置缺失或档位拼错一律按 hidden 处理，绝不 fail-open。
+integration:
+  tothestars:
+    # 总开关。关闭后 tothestars_* 工具对模型不可见，提示词也不注入生活快照。
+    enabled: true
+    endpoint: "http://127.0.0.1:8765"
+    # 单次请求超时（秒）。向着星在本机，正常应在 0.1s 内返回；
+    # 连不上/超时时工具返回"暂时读不到数据"，提示词注入静默跳过，不影响正常聊天。
+    timeout_seconds: 2.0
+    permissions:
+      commissions: "read_write_proactive"   # 每日委托
+      schedule: "read_write_proactive"      # 日程安排
+      legends: "read_only"                  # 传说任务（长期目标）
+      wallet: "read_only"                   # 实践点 / 成长点
+      journal: "on_request"                 # 日记摘要（评分/能量/情绪）
+      journal_text: "hidden"                # 日记正文与照片
+      focus: "read_write_proactive"         # 专注 / 番茄钟
+    # 写入通道（向着星离线时也要能改数据）：
+    #   local  = 在 BetterAgent 进程内直连向着星数据库（同机推荐；复用其服务层与审计）
+    #   remote = 走 HTTP；失败先暂存，之后自动退避重试，成功后前端轻提示（不播报）
+    write_mode: "local"
+    # local 模式下的向着星项目根目录（数据库 = <根目录>/data/growth_system.db）。
+    # 换成自己的安装路径；不需要双反斜杠，普通单反斜杠即可（YAML 双引号里请用 \\）。
+    local_project_root: "C:\\Path\\To\\ToTheStarsWeb\\ToTheStarsWeb"
+    # 主动提及策略（第 7 步实现，先放默认值）
+    proactive:
+      enabled: false
+      quiet_hours: ["23:00", "07:00"]
+      max_per_hour: 2
+      max_per_day: 6
+      # 生活事件桥（services/life_bridge）的轮询间隔（秒）。
+      poll_interval_seconds: 60
+      # 传说任务剩余天数 <= 该值时触发 deadline_near。
+      deadline_days: 3
 
 # LLM Providers Configuration
 llm:
@@ -42,6 +89,19 @@ tools:
   image_gen:
     provider: "gemini"
     model: "gemini-3.1-flash-lite-image"
+  # 联网搜索（L0 全局总开关）。默认关闭。
+  # 关闭时 cognitive 服务不会把 web_search 工具放进给模型看的工具表，
+  # 等价于本项目从未接入过联网 —— 出问题时把它改回 false 即可完整回退。
+  # 开启后仍需在后台填 API Key（见 api_key_env）才算真正可用。
+  web_search:
+    enabled: false
+    provider: "tavily"
+    # 覆盖它的环境变量名（写在根目录 .env）。目前只支持 tavily。
+    api_key_env: "TAVILY_API_KEY"
+    top_k: 5
+    timeout_seconds: 15
+    # 单轮对话最多搜索几次，用于控成本。
+    max_calls_per_turn: 1
 
 tts:
   provider: "gpt_sovits"
@@ -49,6 +109,15 @@ tts:
     endpoint: "http://127.0.0.1:19888/tts"
     voice: "catgirl_tsundere"
     sample_rate: 32000
+    # Inference params tuned for the FurinaCNFinal fine-tune A/B tests (emotion-boosted, 1.0x speed).
+    temperature: 0.70
+    top_k: 8
+    top_p: 1.0
+    speed_factor: 1.0
+    repetition_penalty: 1.5
+    # cut0 = synthesize the whole sentence as one segment (coherent prosody);
+    # cut5 = split on punctuation (lower latency, but prosody resets per clause).
+    text_split_method: "cut0"
 
 
   cosyvoice:
@@ -135,6 +204,15 @@ game_events:
       near_death: 0.8
       victory: 1.0
       death: 0.5
+    # 向着星生活事件（services/life_bridge/life_poller.py -> POST /api/life-event）。
+    # 只决定"冲动有多强"；静默时段与每小时/每天上限由 UrgeEngine 用
+    # integration.tothestars.proactive 的配置统一判定。
+    life:
+      morning_brief: 0.8
+      evening_review: 0.7
+      deadline_near: 1.2
+      required_unfinished: 1.1
+      streak_milestone: 0.5
 
 # STS2 Game Watcher (services/game_watcher/sts2_poller.py) -- polls the
 # STS2MCP mod's local REST API (https://github.com/Gennadiyev/STS2MCP,

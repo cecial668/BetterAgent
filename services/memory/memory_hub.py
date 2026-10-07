@@ -50,7 +50,7 @@ class MemoryHub:
         user_id = int(payload.user_id)
         content_text = payload.raw_text or ""
         if payload.media_type == "photo" and payload.file_path:
-            content_text = f"[主人发送了一张照片: {payload.file_path}] {content_text}".strip()
+            content_text = f"[对方发送了一张照片: {payload.file_path}] {content_text}".strip()
 
         # 用户一来消息就为其登记画像，否则后台用户管理永远看不到新用户
         # （此前只有 admin 手动改画像/记忆时才写 betteragent:profile:*，

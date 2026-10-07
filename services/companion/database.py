@@ -99,11 +99,15 @@ def init_db() -> None:
             )
         """)
 
+        # 默认称呼来自 config/config.yaml 的 persona.default_user_name；
+        # 绝不硬编码「主人」——那是内置猫娘人设的遗留默认值。
+        default_user_name = _default_user_name()
+
         # Seed initial memories if table is empty
         cur.execute("SELECT COUNT(*) as count FROM user_profile_facts")
         if cur.fetchone()["count"] == 0:
             seed_facts = [
-                ("fact_101", 1001, 1, "identity", "用户称呼", "主人"),
+                ("fact_101", 1001, 1, "identity", "用户称呼", default_user_name),
                 ("fact_102", 1001, 1, "identity", "校园身份", "计算机专业应届毕业生"),
                 ("fact_103", 1001, 1, "preference", "喜好游戏", "杀戮尖塔2、二次元手游"),
                 ("fact_104", 1001, 1, "preference", "常用工具", "AIRI 桌面虚拟主播、BetterAgent"),
@@ -114,9 +118,38 @@ def init_db() -> None:
                 seed_facts,
             )
         else:
-            # Clean legacy mock appellation '学弟' to '主人'
-            cur.execute("UPDATE user_profile_facts SET value = '主人' WHERE key = '用户称呼' AND value = '学弟'")
+            # 清洗历史遗留的占位称呼（'学弟' / '主人' 都是旧版内置人设的
+            # 遗留值），统一改写为当前配置的默认称呼。
+            cur.execute(
+                "UPDATE user_profile_facts SET value = ? WHERE key = '用户称呼' AND value IN ('学弟', '主人')",
+                (default_user_name,),
+            )
 
         conn.commit()
     finally:
         conn.close()
+
+
+def _default_user_name() -> str:
+    """角色该怎么称呼用户 —— 由 config/config.yaml 的
+    `persona.default_user_name` 决定。
+
+    刻意不 import shared.config_loader（companion 服务要能独立运行），
+    这里直接读 YAML；读不到就退回中性的「你」，绝不退回「主人」。
+    """
+    try:
+        import yaml
+
+        cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "config",
+            "config.yaml",
+        )
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f) or {}
+        persona = doc.get("persona") or {}
+        if isinstance(persona, dict):
+            return str(persona.get("default_user_name") or "").strip() or "你"
+    except Exception:
+        pass
+    return "你"

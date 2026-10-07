@@ -5,6 +5,7 @@ from services.cognitive.tools.image_gen_tool import ImageGenTool
 from services.cognitive.tools.telegram_action_tool import TelegramActionTool
 from services.cognitive.tools.presenter_control_tool import PresenterControlTool
 from services.cognitive.tools.campus_kb_tool import CampusKBTool
+from services.cognitive.tools.web_search_tool import WebSearchTool
 from services.cognitive.tools.companion_tool import (
     AddScheduleTool,
     QueryScheduleTool,
@@ -14,6 +15,8 @@ from services.cognitive.tools.companion_tool import (
 )
 from services.cognitive.tools.sts2_http_client import Sts2HttpClient
 from services.cognitive.tools.sts2_action_tool import build_sts2_tools
+from services.cognitive.tools.focus_tool import ProposeFocusSessionTool
+from services.cognitive.tools.tothestars_tool import build_tothestars_tools
 from services.cognitive.mcp.presenter_manager import PresenterSessionManager
 
 
@@ -26,11 +29,21 @@ class ToolRegistry:
         self.register(ImageGenTool())
         self.register(TelegramActionTool())
         self.register(CampusKBTool())
+        # 注册即存在，但能否被模型看见由 cognitive_engine 按
+        # tools.web_search 开关 + API Key 每轮门控（见 shared/web_search_config.py）。
+        self.register(WebSearchTool())
         self.register(AddScheduleTool())
         self.register(QueryScheduleTool())
         self.register(DeleteScheduleTool())
         self.register(QueryCompanionStatsTool())
         self.register(GetRecommendationsTool())
+        # 向着星生活数据工具族。注册即存在，但能否被模型看见由 cognitive_engine
+        # 每轮按 integration.tothestars.permissions 门控（见 shared/life_data_permissions.py）。
+        for tool in build_tothestars_tools():
+            self.register(tool)
+        # 专注模式（番茄钟）提议工具：不进向着星权限矩阵（起计时是本地能力，
+        # 真正的写入发生在自然结束、用户提交总结之后）。
+        self.register(ProposeFocusSessionTool())
         if presenter_manager is not None:
             self.register(PresenterControlTool(presenter_manager))
 

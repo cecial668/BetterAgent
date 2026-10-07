@@ -26,6 +26,69 @@ export type TextDeltaCallback = (text: string, isFinal: boolean, chatId?: number
 export type EmotionCallback = (emotion: string, action?: string) => void
 export type AudioChunkCallback = (audioBase64: string, sampleRate: number, chatId?: number, visemes?: Viseme[], textSegment?: string) => void
 export type StateChangeCallback = (state: string, chatId?: number, reason?: string) => void
+
+/**
+ * 工具执行进度（Layer 4）。目前只有联网搜索会发：phase="start" 表示搜索已发起
+ * （前端该显示"正在查阅资料…"），phase="done" 表示搜索结束（该撤掉提示）。
+ * label 是角色卡渲染好的人设化文案，前端原样显示，不要自己拼"正在搜索"。
+ */
+export interface ToolActivityPayload {
+  chat_id?: number
+  tool: string
+  phase: 'start' | 'done' | string
+  label?: string
+}
+export type ToolActivityCallback = (activity: ToolActivityPayload) => void
+
+/**
+ * 向着星写入提议（确认框）帧。phase 生命周期：
+ * pending → executing → executed | failed，或 pending → cancelled | expired。
+ * 用户在框里点确认/取消后，前端通过 sendLifeDecision 把哨兵文本走普通
+ * user.text 发回；在用户确认之前后端不会写入任何数据。
+ */
+export interface LifeProposalPayload {
+  chat_id?: number
+  proposal_id: string
+  phase: 'pending' | 'executing' | 'executed' | 'failed' | 'cancelled' | 'expired' | string
+  kind?: string
+  params?: Record<string, any>
+  summary?: string
+  message?: string
+}
+export type LifeProposalCallback = (proposal: LifeProposalPayload) => void
+
+/** 确认框决策的哨兵前缀；后端 cognitive_engine.parse_life_decision 依赖它。 */
+export const LIFE_DECISION_PREFIX = '【确认框】'
+
+/**
+ * 专注模式（番茄钟）状态帧。Go 的 FocusManager 是计时唯一真源：剩余时间以
+ * 广播为准，前端只用 deadline_unix 本地平滑倒数、每次广播再校正。
+ * phase=completed 表示自然结束，等待用户在总结弹窗里提交内容。
+ */
+export interface FocusStatePayload {
+  chat_id?: number
+  phase: 'idle' | 'running' | 'paused' | 'completed' | string
+  planned_minutes: number
+  remaining_seconds: number
+  started_at_unix?: number
+  deadline_unix?: number
+  elapsed_seconds?: number
+}
+export type FocusStateCallback = (state: FocusStatePayload) => void
+
+/** 专注挂件控制哨兵；后端 cognitive_engine.parse_focus_control 依赖它。 */
+export const FOCUS_CONTROL_PREFIX = '【专注】'
+
+/**
+ * 轻量 UI 通知（不经过 LLM、不播报）：目前用于「远程连接」模式下暂存的
+ * 向着星写入补交成功/放弃。前端只弹一条低优先级 toast。
+ */
+export interface NoticePayload {
+  level?: 'info' | 'warn' | string
+  title?: string
+  message: string
+}
+export type NoticeCallback = (notice: NoticePayload) => void
 export type STTTranscriptCallback = (text: string, isFinal: boolean, chatId?: number) => void
 export interface GameStatePayload {
   floor: number
@@ -50,6 +113,23 @@ export interface EmotionalStatePayload {
 export type EmotionStateCallback = (state: EmotionalStatePayload, action?: string) => void
 
 const STORAGE_CHAT_ID_KEY = 'betteragent:web:chat_id'
+
+/**
+ * WebGateway 会话命名空间偏移（镜像 Go core/internal/idspace/idspace.go 的
+ * WebNamespaceOffset）。
+ *
+ * 前端在 URL / localStorage 里持有的是**子 id**（见下面的 resolveStableChatId），
+ * 而 Go 回传的每一帧 payload.chat_id 都是**折叠后**的 id（子 id + 该偏移）。
+ * 两边必须先折到同一侧再比较，否则 isChatMatch 会把所有带 chat_id 的帧全部丢掉
+ * ——联网搜索提示（agent.tool_activity）和 agent.state_change 都因此消失过。
+ * 反过来要调 Companion/HTTP 接口时，用「子 id + 该偏移」还原真实 chat_id。
+ */
+export const WEB_NAMESPACE_OFFSET = 9_000_000_000_000_000
+
+/** 把服务端折叠过的 chat_id 折回前端持有的子 id（本来就未折叠的原样返回）。 */
+export function toSubChatId(chatId: number): number {
+  return chatId >= WEB_NAMESPACE_OFFSET ? chatId - WEB_NAMESPACE_OFFSET : chatId
+}
 
 export function resolveStableChatId(): number {
   if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_BETTERAGENT_USER_ID) {
@@ -134,7 +214,12 @@ export class BetterAgentWSBridge {
   private pendingTextSegment: string | undefined
   private sttTranscriptListeners: Set<STTTranscriptCallback> = new Set()
   private stateChangeListeners: Set<StateChangeCallback> = new Set()
+  private toolActivityListeners: Set<ToolActivityCallback> = new Set()
+  private lifeProposalListeners: Set<LifeProposalCallback> = new Set()
+  private focusStateListeners: Set<FocusStateCallback> = new Set()
+  private noticeListeners: Set<NoticeCallback> = new Set()
   private gameStateListeners: Set<GameStateCallback> = new Set()
+  private openListeners: Set<() => void> = new Set()
 
   constructor(serverUrl = 'ws://localhost:8080/ws') {
     const existingChatId = (() => {
@@ -196,6 +281,14 @@ export class BetterAgentWSBridge {
         // every future audio frame for that chat to be misjudged as stale
         // and silently dropped forever.
         this.latestGenerationByChat.clear()
+        this.openListeners.forEach((cb) => {
+          try {
+            cb()
+          }
+          catch (err) {
+            console.warn('[BetterAgentWSBridge] onOpen listener threw:', err)
+          }
+        })
       }
 
       this.ws.onmessage = (event: MessageEvent) => {
@@ -233,12 +326,17 @@ export class BetterAgentWSBridge {
     try {
       const msg: WSMessage = JSON.parse(event.data)
       switch (msg.type) {
-        case 'agent.text_delta':
-          if (msg.payload?.text) {
-            const citations: Citation[] | undefined = Array.isArray(msg.payload.citations) ? msg.payload.citations : undefined
-            this.textDeltaListeners.forEach(cb => cb(msg.payload.text, !!msg.payload.is_final, msg.payload.chat_id, citations))
+        case 'agent.text_delta': {
+          // text 可以为空：本轮没有剩余句子可播时，后端会单独发一条只带
+          // citations 的收尾帧（见 Go 侧 handleActionDecisionMsg），所以判空条件
+          // 必须把 citations 也算上，否则"她的消息来源"永远收不到东西。
+          const hasCitations = Array.isArray(msg.payload?.citations) && msg.payload.citations.length > 0
+          if (msg.payload && (msg.payload.text || hasCitations)) {
+            const citations: Citation[] | undefined = hasCitations ? msg.payload.citations : undefined
+            this.textDeltaListeners.forEach(cb => cb(msg.payload.text ?? '', !!msg.payload.is_final, msg.payload.chat_id, citations))
           }
           break
+        }
 
         case 'agent.emotion':
           if (msg.payload) {
@@ -270,6 +368,30 @@ export class BetterAgentWSBridge {
         case 'agent.stt_transcript':
           if (msg.payload?.text) {
             this.sttTranscriptListeners.forEach(cb => cb(msg.payload.text, !!msg.payload.is_final, msg.payload.chat_id))
+          }
+          break
+
+        case 'agent.tool_activity':
+          if (msg.payload?.tool) {
+            this.toolActivityListeners.forEach(cb => cb(msg.payload as ToolActivityPayload))
+          }
+          break
+
+        case 'agent.life_proposal':
+          if (msg.payload?.proposal_id) {
+            this.lifeProposalListeners.forEach(cb => cb(msg.payload as LifeProposalPayload))
+          }
+          break
+
+        case 'agent.focus_state':
+          if (msg.payload?.phase) {
+            this.focusStateListeners.forEach(cb => cb(msg.payload as FocusStatePayload))
+          }
+          break
+
+        case 'agent.notice':
+          if (msg.payload?.message) {
+            this.noticeListeners.forEach(cb => cb(msg.payload as NoticePayload))
           }
           break
 
@@ -334,6 +456,50 @@ export class BetterAgentWSBridge {
     }
   }
 
+  /**
+   * 报告"前端页面刚打开"，由 Go 侧触发一次主动打招呼（见 handleUserGreeting）。
+   * awaySeconds 是上一次打开页面距今的秒数，首次访问不传。
+   * 服务端有 10 秒冷却与"忙时不打扰"守卫，重复发送是安全的。
+   */
+  public sendGreeting(awaySeconds?: number): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      const msg: WSMessage = {
+        type: 'user.greeting',
+        payload: awaySeconds && awaySeconds > 0 ? { away_seconds: Math.round(awaySeconds) } : {},
+      }
+      this.ws.send(JSON.stringify(msg))
+    }
+  }
+
+  /**
+   * 发送确认框决策。哨兵文本走普通 user.text，因此确认后的执行与语言反馈
+   * 复用完整对话管线（记忆/情绪/流式回复），且聊天记录里不会多出一条机器消息
+   * （由调用方决定不把它加进 UI）。
+   */
+  public sendLifeDecision(proposalId: string, action: 'confirm' | 'cancel', edits?: Record<string, unknown>): void {
+    const sentinel = `${LIFE_DECISION_PREFIX}${JSON.stringify({ v: 1, id: proposalId, action, edits: edits || {} })}`
+    this.sendUserText(sentinel)
+  }
+
+  /** 询问当前专注状态；Go 会把 agent.focus_state 只回给发起请求的这个页面。 */
+  public sendFocusStatus(): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'user.focus_status' }))
+    }
+  }
+
+  /**
+   * 发送专注挂件控制（暂停/继续/放弃/提交总结），与确认框一样走哨兵文本：
+   * 引擎确定性转成 FocusCommandPayload 交给 Go 的 FocusManager，模型只负责说。
+   */
+  public sendFocusControl(
+    action: 'pause' | 'resume' | 'abandon' | 'finish',
+    extra: Record<string, unknown> = {},
+  ): void {
+    const sentinel = `${FOCUS_CONTROL_PREFIX}${JSON.stringify({ v: 1, action, ...extra })}`
+    this.sendUserText(sentinel)
+  }
+
   public sendSpeechStart(): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: 'user.speech_start' }))
@@ -375,6 +541,24 @@ export class BetterAgentWSBridge {
     return () => this.textDeltaListeners.delete(cb)
   }
 
+  /** 注册 WS 连接成功回调（含重连）；返回取消注册函数。 */
+  public onOpen(cb: () => void): () => void {
+    this.openListeners.add(cb)
+    return () => this.openListeners.delete(cb)
+  }
+
+  /** 订阅专注状态广播（含状态查询回帧）；返回取消注册函数。 */
+  public onFocusState(cb: FocusStateCallback): () => void {
+    this.focusStateListeners.add(cb)
+    return () => this.focusStateListeners.delete(cb)
+  }
+
+  /** 订阅轻量 UI 通知（补交成功等）；返回取消注册函数。 */
+  public onNotice(cb: NoticeCallback): () => void {
+    this.noticeListeners.add(cb)
+    return () => this.noticeListeners.delete(cb)
+  }
+
   public onEmotion(cb: EmotionCallback): () => void {
     this.emotionListeners.add(cb)
     return () => this.emotionListeners.delete(cb)
@@ -403,6 +587,16 @@ export class BetterAgentWSBridge {
       }
       this.ws.send(JSON.stringify(msg))
     }
+  }
+
+  public onToolActivity(cb: ToolActivityCallback): () => void {
+    this.toolActivityListeners.add(cb)
+    return () => this.toolActivityListeners.delete(cb)
+  }
+
+  public onLifeProposal(cb: LifeProposalCallback): () => void {
+    this.lifeProposalListeners.add(cb)
+    return () => this.lifeProposalListeners.delete(cb)
   }
 
   public onEmotionState(cb: EmotionStateCallback): () => void {

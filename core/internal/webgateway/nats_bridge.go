@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -178,6 +179,7 @@ type NatsBridge struct {
 	circadian           *emotion.CircadianRhythmEvaluator
 	urgeEngine          *engine.UrgeEngine
 	autonomousPlayState *engine.AutonomousPlayState
+	focus               *engine.FocusManager
 	deferredTexts       *deferredTextManager
 	logger              *zap.Logger
 
@@ -189,6 +191,12 @@ type NatsBridge struct {
 	// apart from "Go received and forwarded it fine, the provider is the
 	// problem" without needing to re-instrument anything.
 	loggedFirstAudioFrame sync.Once
+
+	// user.greeting de-duplication: one browser page load sends exactly one
+	// greeting, but a double-open (two tabs racing) or an F5 storm must not
+	// turn into a burst of LLM turns. Guarded by greetingMu, keyed by chat_id.
+	greetingMu     sync.Mutex
+	lastGreetingAt map[int64]time.Time
 }
 
 func newNatsBridge(
@@ -212,6 +220,7 @@ func newNatsBridge(
 		urgeEngine:          urgeEngine,
 		autonomousPlayState: autonomousPlayState,
 		deferredTexts:       newDeferredTextManager(),
+		lastGreetingAt:      make(map[int64]time.Time),
 		logger:              logger,
 	}
 	b.registerWatchdogTimeoutCallback()
@@ -302,6 +311,20 @@ func (b *NatsBridge) StartSubscriptions() error {
 		b.handleEmotionDeltaMsg(msg)
 	})
 
+	// 3b. Tool-execution progress (Layer 4). Forwarded verbatim so the browser
+	// can render a "looking it up..." indicator during the 3-8s a search takes.
+	_, _ = b.bus.Subscribe(bus.SubjectToolActivity, func(msg *nats.Msg) {
+		b.handleToolActivityMsg(msg)
+	})
+
+	// 3c. 向着星 write-proposal confirmation box (pending/executing/executed/
+	// failed/cancelled/expired). Forwarded to the browser as
+	// agent.life_proposal; the user's decision comes back as a normal
+	// user.text sentinel and never needs its own subject.
+	_, _ = b.bus.Subscribe(bus.SubjectLifeProposal, func(msg *nats.Msg) {
+		b.handleLifeProposalMsg(msg)
+	})
+
 	// 4. Subscribe to STT Final Transcripts from services/stt -- treated
 	// exactly like the user having typed the text (see publishInboundMessage).
 	_, _ = b.bus.Subscribe(bus.SubjectSTTStreamFinal, func(msg *nats.Msg) {
@@ -324,6 +347,9 @@ func (b *NatsBridge) StartSubscriptions() error {
 	})
 	_, _ = b.bus.Subscribe(bus.SubjectStreamCancelAck, func(msg *nats.Msg) {
 		b.handleStreamCancelAckMsg(msg)
+	})
+	_, _ = b.bus.Subscribe(bus.SubjectNotice, func(msg *nats.Msg) {
+		b.handleNoticeMsg(msg)
 	})
 
 	b.logger.Info("NATS Bridge subscriptions initialized for WebGateway")
@@ -361,18 +387,9 @@ func (b *NatsBridge) HandleUserWSMessage(session *ClientSession, msgType websock
 	case "user.text":
 		var p UserTextMessagePayload
 		if err := json.Unmarshal(wsMsg.Payload, &p); err == nil && p.Text != "" {
-			if strings.Contains(p.Text, "[喂食金枪鱼]") || strings.HasPrefix(p.Text, "/feed") {
-				st := b.getEmotionalStateForChat(session.ChatID)
-				if st != nil {
-					st.ApplySatietyDelta(0.35)
-					st.ApplySentimentDelta(0.1, 0.1, 1.0)
-					outBytes, _ := json.Marshal(WSMessage{
-						Type:    "agent.emotion",
-						Payload: marshalRaw(b.buildAgentEmotionPayload(session.ChatID, string(st.CurrentMoodTag), "")),
-					})
-					b.sessions.SendTextToChat(session.ChatID, outBytes)
-				}
-			}
+			// 用户发言即"认领"这个页面为当前活跃屏幕：音频只发给它，避免同一
+			// chat 的多个页面把同一句语音各播一遍（叠唱）。
+			b.sessions.MarkActive(session.ChatID, session.ID)
 			// chat_id is always pinned to the authenticated session, never
 			// taken from the message body -- otherwise a client could
 			// address (and read the memory of) an arbitrary chat_id per message.
@@ -382,12 +399,31 @@ func (b *NatsBridge) HandleUserWSMessage(session *ClientSession, msgType websock
 	case "user.interrupt":
 		b.handleBargeInInterrupt(session.ChatID)
 
+	case "user.greeting":
+		b.handleUserGreeting(session, wsMsg.Payload)
+
+	case "user.focus_status":
+		// The widget asks for the authoritative state right after a page load
+		// (reconnects and F5 included); reply only to this session so a
+		// background tab's request never lands on the foreground one.
+		state := engine.FocusState{ChatID: session.ChatID, Phase: engine.FocusPhaseIdle}
+		if b.focus != nil {
+			state = b.focus.State(session.ChatID)
+		}
+		outBytes, _ := json.Marshal(WSMessage{
+			Type:    "agent.focus_state",
+			Payload: marshalRaw(state),
+		})
+		session.SendText(outBytes)
+
 	case "user.speech_start":
 		// Same "stop whatever the agent is currently saying" reaction as
 		// user.interrupt (VAD firing speech_start while the agent is mid-
 		// TALKING is exactly a barge-in), plus attempt to start a listening
 		// session -- harmless no-op via IsValidTransition if there was
 		// nothing to barge into (e.g. starting a fresh turn from IDLE).
+		// 语音输入同样认领活跃屏幕（音频只回给正在说话的这个页面）。
+		b.sessions.MarkActive(session.ChatID, session.ID)
 		b.handleBargeInInterrupt(session.ChatID)
 		if b.csm != nil {
 			b.csm.TransitionToChat(session.ChatID, engine.StateListening, "vad_speech_start")
@@ -705,7 +741,7 @@ func (b *NatsBridge) handleGameStartStopCommand(chatID int64, text string) bool 
 				b.logger.Error("Failed to publish UserInterrupt on /game_stop", zap.Int64("chat_id", deactivatedChatID), zap.Error(err))
 			}
 		}
-		b.replyDirect(chatID, "游戏自动托管已停止，操作权还给主人啦。")
+		b.replyDirect(chatID, "游戏自动托管已停止，操作权已经还给你啦。")
 		return true
 	}
 	return false
@@ -825,6 +861,28 @@ func (b *NatsBridge) handleActionDecisionMsg(msg *nats.Msg) {
 			}),
 		})
 		b.sessions.SendTextToChat(decision.ChatID, stateBytes)
+	} else if len(decision.Citations) > 0 {
+		// 无文字、但有参考资料的"收尾决策"。
+		//
+		// cognitive_engine 在本轮流式输出结束后，如果尾部 flush 没有剩下句子，
+		// 会单独发一条 text_content="" + is_final=true 的 ActionDecision，并把本轮
+		// 收集到的 citations 挂在它身上（见 services/cognitive/cognitive_engine.py
+		// 的 final-marker 分支）。上面那个 if 要求 text 非空，于是这条决策以前被
+		// 整个跳过 —— 浏览器永远收不到 citations，前端"她的消息来源"面板因此一直
+		// 是空的（只有尾部恰好还剩一句话可播时才会亮，所以看起来时有时无）。
+		//
+		// IsFinal 原样透传：文本为空的帧由前端单独处理，只用来补 citations，
+		// 不参与"流开始/结束"的生命周期判断（见 betteragent-gateway.ts 的注释）。
+		outBytes, _ := json.Marshal(WSMessage{
+			Type: "agent.text_delta",
+			Payload: marshalRaw(AgentTextDeltaPayload{
+				Text:       "",
+				EmotionTag: b.getMoodTagForChat(decision.ChatID),
+				IsFinal:    decision.IsFinal,
+				Citations:  convertCitations(decision.Citations),
+			}),
+		})
+		b.sessions.SendTextToChat(decision.ChatID, outBytes)
 	}
 
 	if decision.StickerID != nil || decision.ReactionEmoji != nil {
@@ -1006,6 +1064,68 @@ func (b *NatsBridge) handleEmotionUpdateMsg(msg *nats.Msg) {
 	b.sessions.SendTextToChat(p.ChatID, outBytes)
 }
 
+// handleToolActivityMsg forwards a tool-execution progress event to the
+// browser verbatim. It deliberately does NOT touch the CSM: "a search is
+// running" is a tool-level transient, not a conversation state, and driving
+// the state machine from here would fight the STREAMING_TTS transitions that
+// ActionDecision already owns (see handleActionDecisionMsg).
+func (b *NatsBridge) handleToolActivityMsg(msg *nats.Msg) {
+	var env struct {
+		Payload schema.ToolActivityPayload `json:"payload"`
+	}
+	if err := json.Unmarshal(msg.Data, &env); err != nil {
+		return
+	}
+
+	p := env.Payload
+	if p.ChatID == 0 {
+		return
+	}
+
+	outBytes, _ := json.Marshal(WSMessage{
+		Type: "agent.tool_activity",
+		Payload: marshalRaw(AgentToolActivityPayload{
+			ChatID: p.ChatID,
+			Tool:   p.Tool,
+			Phase:  p.Phase,
+			Label:  p.Label,
+		}),
+	})
+	b.sessions.SendTextToChat(p.ChatID, outBytes)
+}
+
+// handleLifeProposalMsg forwards a 向着星 write-proposal confirmation-box
+// event to the browser verbatim. Like tool activity, it never touches the
+// CSM: the box may open mid-turn (while the model is still speaking the
+// proposal) and resolve on a later user turn.
+func (b *NatsBridge) handleLifeProposalMsg(msg *nats.Msg) {
+	var env struct {
+		Payload schema.LifeProposalPayload `json:"payload"`
+	}
+	if err := json.Unmarshal(msg.Data, &env); err != nil {
+		return
+	}
+
+	p := env.Payload
+	if p.ChatID == 0 || p.ProposalID == "" {
+		return
+	}
+
+	outBytes, _ := json.Marshal(WSMessage{
+		Type: "agent.life_proposal",
+		Payload: marshalRaw(AgentLifeProposalPayload{
+			ChatID:     p.ChatID,
+			ProposalID: p.ProposalID,
+			Phase:      p.Phase,
+			Kind:       p.Kind,
+			Params:     p.Params,
+			Summary:    p.Summary,
+			Message:    p.Message,
+		}),
+	})
+	b.sessions.SendTextToChat(p.ChatID, outBytes)
+}
+
 func (b *NatsBridge) handleEmotionDeltaMsg(msg *nats.Msg) {
 	var env struct {
 		Payload schema.EmotionDeltaPayload `json:"payload"`
@@ -1130,8 +1250,246 @@ func (b *NatsBridge) handleScheduleFiredMsg(msg *nats.Msg) {
 		reason += "（" + p.Note + "）"
 	}
 
-	engine.PublishProactiveTurn(b.bus, b.csm, b.getEmotionalStateForChat(p.ChatID), b.personality, b.circadian, p.ChatID, reason, b.logger)
+	engine.PublishProactiveTurn(b.bus, b.csm, b.getEmotionalStateForChat(p.ChatID), b.personality, b.circadian, b.focus, p.ChatID, reason, b.logger)
 	b.logger.Info("⏰ Schedule fired -> proactive turn triggered", zap.Int64("chat_id", p.ChatID), zap.String("title", p.Title))
+}
+
+// SetFocusManager wires the focus-mode/pomodoro state owner: command
+// subscription (engine → Go), state broadcast (Go → engine via NATS, Go →
+// browser via WS), and the natural-completion trigger. Called once from
+// main.go; a nil manager leaves focus mode unavailable.
+func (b *NatsBridge) SetFocusManager(focus *engine.FocusManager) {
+	if focus == nil {
+		return
+	}
+	b.focus = focus
+	focus.SetOnChange(b.onFocusStateChange)
+	focus.SetOnComplete(b.onFocusComplete)
+	if _, err := b.bus.Subscribe(bus.SubjectFocusCommand, func(msg *nats.Msg) {
+		b.handleFocusCommandMsg(msg)
+	}); err != nil {
+		b.logger.Error("Failed to subscribe to focus commands", zap.Error(err))
+	}
+}
+
+// handleFocusCommandMsg applies a deterministic focus command produced by the
+// cognitive engine after the user confirmed/operated the dialog. Go owns the
+// timer; the engine never computes countdowns itself.
+func (b *NatsBridge) handleFocusCommandMsg(msg *nats.Msg) {
+	var env struct {
+		Payload schema.FocusCommandPayload `json:"payload"`
+	}
+	if err := json.Unmarshal(msg.Data, &env); err != nil {
+		b.logger.Warn("Failed to unmarshal focus command", zap.Error(err))
+		return
+	}
+	p := env.Payload
+	if p.ChatID == 0 || b.focus == nil {
+		return
+	}
+
+	switch p.Action {
+	case "start":
+		b.focus.Start(p.ChatID, p.Minutes)
+	case "pause":
+		b.focus.Pause(p.ChatID)
+	case "resume":
+		b.focus.Resume(p.ChatID)
+	case "end":
+		b.focus.End(p.ChatID)
+	default:
+		b.logger.Warn("Unknown focus command action", zap.String("action", p.Action), zap.Int64("chat_id", p.ChatID))
+		return
+	}
+	b.logger.Info("🎯 Focus command applied",
+		zap.Int64("chat_id", p.ChatID),
+		zap.String("action", p.Action),
+		zap.Int("minutes", p.Minutes),
+		zap.String("outcome", p.Outcome),
+	)
+}
+
+// onFocusStateChange broadcasts every state mutation: to NATS so the
+// cognitive engine can inject the focus-mode prompt, and to all browser
+// sessions of the chat so the countdown widget converges on one truth.
+func (b *NatsBridge) onFocusStateChange(state engine.FocusState) {
+	if err := b.bus.Publish(bus.SubjectFocusState, "web_gateway", state); err != nil {
+		b.logger.Warn("Failed to publish focus state to NATS", zap.Error(err))
+	}
+	outBytes, err := json.Marshal(WSMessage{
+		Type:    "agent.focus_state",
+		Payload: marshalRaw(state),
+	})
+	if err != nil {
+		return
+	}
+	b.sessions.SendTextToChat(state.ChatID, outBytes)
+}
+
+// onFocusComplete fires once when the countdown runs out naturally. The
+// completion is no longer "active" at this point, so the proactive gate lets
+// this turn through. It only sets the scene for the summary popup -- the
+// real, content-specific praise comes after the user submits the form.
+func (b *NatsBridge) onFocusComplete(state engine.FocusState) {
+	reason := fmt.Sprintf(
+		"对方的番茄钟刚刚自然结束（原计划 %d 分钟），他/她还在屏幕前。请先用一句话提醒时间到了、语气可以带上欣慰；"+
+			"并请他/她在弹出的「专注总结」弹窗里填好分类和这次完成了什么。先不要长篇夸奖或复述计划，等他/她提交后再围绕内容收尾。",
+		state.PlannedMinutes,
+	)
+	engine.PublishProactiveTurn(b.bus, b.csm, b.getEmotionalStateForChat(state.ChatID), b.personality, b.circadian, b.focus, state.ChatID, reason, b.logger)
+	b.logger.Info("🔔 Focus completed -> summary turn triggered", zap.Int64("chat_id", state.ChatID))
+}
+
+// Greeting de-dup window. Browsers send at most one user.greeting per page
+// load and the frontend already guards against WS reconnects; this cooldown
+// exists for the races the frontend cannot see (two tabs opening together).
+const greetingCooldown = 10 * time.Second
+
+// greetingAngles are the flavors a greeting can take, picked at random per
+// page open so consecutive days do not converge on the same "早上好" line.
+// These are prompt hints, not templates -- the model renders them in persona.
+var greetingAngles = []string{
+	"简短寒暄问候",
+	"顺口提一句今天的安排或日程（有就轻提，没有就别硬编）",
+	"分享一件当天的小事或有趣的见闻",
+	"提一句最近在忙/在学什么，或者你刚做完的事",
+	"顺着上次聊天的话题开头",
+	"关心一下对方这个时间点在做什么",
+}
+
+// handleUserGreeting turns a "page just opened" signal into a proactive
+// reasoning turn. Guards, in order:
+//  1. never barge into a running turn (listening/thinking/talking) -- if the
+//     user refreshes mid-conversation, the greeting is simply skipped;
+//  2. per-chat cooldown so two tabs opening at once produce one greeting;
+//  3. the waking page becomes the active screen so TTS audio lands there
+//     (same rule as user.text, see SendBinaryToChat).
+func (b *NatsBridge) handleUserGreeting(session *ClientSession, raw json.RawMessage) {
+	if session == nil {
+		return
+	}
+	var p UserGreetingPayload
+	// The payload is optional: a bare frame is a valid "page opened".
+	_ = json.Unmarshal(raw, &p)
+
+	chatID := session.ChatID
+
+	// 专注模式 = 请勿打扰：即使 CSM 处于可被搭话的 IDLE/SLEEPING，番茄钟
+	// 期间的"打开页面"也不再触发招呼（否则刷新一次就破功）。
+	if b.focus != nil && b.focus.IsActive(chatID) {
+		b.logger.Debug("user.greeting skipped: focus mode active", zap.Int64("chat_id", chatID))
+		return
+	}
+
+	if b.csm != nil {
+		if state := b.csm.GetChatState(chatID); !greetingAllowedState(state) {
+			b.logger.Debug("user.greeting skipped: chat is not idle/resting",
+				zap.Int64("chat_id", chatID), zap.String("state", string(state)))
+			return
+		}
+	}
+
+	if !b.reserveGreetingSlot(chatID) {
+		b.logger.Debug("user.greeting skipped: within cooldown", zap.Int64("chat_id", chatID))
+		return
+	}
+
+	b.sessions.MarkActive(chatID, session.ID)
+
+	reason := buildGreetingReason(p.AwaySeconds)
+	engine.PublishProactiveTurn(b.bus, b.csm, b.getEmotionalStateForChat(chatID), b.personality, b.circadian, b.focus, chatID, reason, b.logger)
+	b.logger.Info("👋 Page opened -> proactive greeting turn",
+		zap.Int64("chat_id", chatID),
+		zap.Bool("has_away", p.AwaySeconds != nil),
+	)
+}
+
+// greetingAllowedState limits greetings to states where starting a proactive
+// turn is safe and non-disruptive. LISTENING/STREAMING_STT mean the user is
+// speaking right now, THINKING/TALKING a turn is underway -- greeting into
+// any of those would barge in or be dropped mid-stream.
+func greetingAllowedState(state engine.State) bool {
+	switch state {
+	case engine.StateIdle, engine.StateSleeping, engine.StateMoodyRest:
+		return true
+	default:
+		return false
+	}
+}
+
+// reserveGreetingSlot stamps and returns true once the cooldown has elapsed
+// for the chat, false while a recent greeting is still within it.
+func (b *NatsBridge) reserveGreetingSlot(chatID int64) bool {
+	b.greetingMu.Lock()
+	defer b.greetingMu.Unlock()
+	if b.lastGreetingAt == nil {
+		b.lastGreetingAt = make(map[int64]time.Time)
+	}
+	now := time.Now()
+	if last, ok := b.lastGreetingAt[chatID]; ok && now.Sub(last) < greetingCooldown {
+		return false
+	}
+	b.lastGreetingAt[chatID] = now
+	return true
+}
+
+// buildGreetingReason renders the proactive_reason handed to the cognitive
+// engine. It is injected verbatim into the system prompt ("[主动搭话] ...
+// 原因: ..."), so this is where greeting variety and the "not a system
+// notice" tone are decided.
+func buildGreetingReason(awaySeconds *int64) string {
+	angle := greetingAngles[rand.Intn(len(greetingAngles))]
+	reason := "用户刚刚打开了前端页面（上线了），主动打个招呼。"
+	reason += "本次优先用这个角度：" + angle + "。"
+	if awaySeconds != nil && *awaySeconds > 0 {
+		reason += "距离对方上次打开前端页面已经过了" + formatAwayDuration(*awaySeconds) + "。"
+	}
+	reason += "要求：自然、口语化，1~2 句就好；像真人见面随口招呼，别像系统通知，也别每次都是一样的句式。"
+	return reason
+}
+
+// formatAwayDuration renders an away time in coarse human terms -- exact
+// minutes/days would make the greeting read like a log line, not a friend
+// noticing you were gone.
+func formatAwayDuration(seconds int64) string {
+	switch {
+	case seconds >= 30*86400:
+		return "一个多月"
+	case seconds >= 86400:
+		return fmt.Sprintf("%d 天", seconds/86400)
+	case seconds >= 3600:
+		return fmt.Sprintf("%d 小时", seconds/3600)
+	case seconds >= 60:
+		return fmt.Sprintf("%d 分钟", seconds/60)
+	default:
+		return "一小会儿"
+	}
+}
+
+// handleNoticeMsg forwards UI-only notices (queued 向着星 writes delivered or
+// given up) to every connected browser as an agent.notice frame. Deliberately
+// no CSM, no LLM, no TTS: this is a toast, not the agent speaking.
+func (b *NatsBridge) handleNoticeMsg(msg *nats.Msg) {
+	var env struct {
+		Payload schema.NoticePayload `json:"payload"`
+	}
+	if err := json.Unmarshal(msg.Data, &env); err != nil {
+		b.logger.Warn("Failed to unmarshal notice", zap.Error(err))
+		return
+	}
+	p := env.Payload
+	if p.Message == "" {
+		return
+	}
+	outBytes, err := json.Marshal(WSMessage{
+		Type:    "agent.notice",
+		Payload: marshalRaw(p),
+	})
+	if err != nil {
+		return
+	}
+	b.sessions.BroadcastText(outBytes)
+	b.logger.Info("🔔 UI notice broadcast", zap.String("level", p.Level), zap.String("message", p.Message))
 }
 
 func (b *NatsBridge) handleStreamCancelAckMsg(msg *nats.Msg) {

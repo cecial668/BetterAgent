@@ -9,6 +9,7 @@ import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
 
 import { EMOTION_ACTION_NAME } from '../constants/actions'
+import { EMOTION_VALUES } from '../constants/emotions'
 import { supportedControl, useMMDViewControl } from './view-control'
 
 type BroadcastChannelEvents
@@ -161,6 +162,14 @@ export const useMMD = defineStore('mmd', () => {
   const availableMotions = useLocalStorageManualReset<MMDMotionDescriptor[]>('settings/mmd/motions', () => [])
 
   /**
+   * 是否对导入动作做"根骨骼首帧归一化"（默认开启）。
+   * 「背景角色用」对谈动作会把站位（如 x=±8）与朝向（偏航 ±90°）写死在根骨骼
+   * 上，不归一化角色就会跑到侧边、转身对着空气说话。需要保留原始走位的动作
+   * （如舞蹈）可以关掉。
+   */
+  const normalizeRootMotion = useLocalStorageManualReset<boolean>('settings/mmd/normalize-root-motion', true)
+
+  /**
    * Persists a VMD file to IndexedDB and adds it to the synced list.
    *
    * Re-importing the same name overwrites the stored file (same id) so the
@@ -205,6 +214,85 @@ export const useMMD = defineStore('mmd', () => {
     'settings/mmd/emotion-action-map',
     () => ({ ...EMOTION_ACTION_NAME }),
   )
+
+  // === 动作组（情绪/情景 → 动作列表，触发时随机播放一个）===
+
+  /**
+   * 每种情绪对应一组可互相替换的演绎动作。LLM 给某句台词标了情绪时，
+   * 从这里随机挑一个播放；比"一情绪一动作"更有变化。
+   */
+  const emotionActionGroups = useLocalStorageManualReset<Record<Emotion, string[]>>(
+    'settings/mmd/emotion-action-groups',
+    () => EMOTION_VALUES.reduce((groups, emotion) => {
+      groups[emotion] = []
+      return groups
+    }, {} as Record<Emotion, string[]>),
+  )
+
+  /** 通用备选动作组：某情绪组为空时回退用它；也为空则不播动作（仅表情）。 */
+  const fallbackActionGroup = useLocalStorageManualReset<string[]>(
+    'settings/mmd/fallback-action-group',
+    () => [],
+  )
+
+  /** 待机随机动作：空闲一段时间后从该组里随机播放一个。 */
+  const idleRandomEnabled = useLocalStorageManualReset<boolean>('settings/mmd/idle-random-enabled', true)
+  const idleActionGroup = useLocalStorageManualReset<string[]>('settings/mmd/idle-action-group', () => [])
+  const idleRandomMinSeconds = useLocalStorageManualReset<number>('settings/mmd/idle-random-min-seconds', 6)
+  const idleRandomMaxSeconds = useLocalStorageManualReset<number>('settings/mmd/idle-random-max-seconds', 15)
+  /** 说话时持续动作：说话期间从当前情绪动作组里连续随机播放（与待机随机无关）。 */
+  const speakingGesturesEnabled = useLocalStorageManualReset<boolean>('settings/mmd/speaking-gestures-enabled', true)
+
+  // 一次性迁移：把旧的"每情绪单动作"并入动作组。旧值等于内置默认名、或组里
+  // 已有内容时不动，避免覆盖玩家已经编排好的分组。
+  for (const emotion of EMOTION_VALUES) {
+    const legacy = emotionActionMap.value[emotion]
+    if (
+      legacy
+      && legacy !== EMOTION_ACTION_NAME[emotion]
+      && !(emotionActionGroups.value[emotion]?.length)
+    ) {
+      emotionActionGroups.value = { ...emotionActionGroups.value, [emotion]: [legacy] }
+    }
+  }
+
+  function addEmotionAction(emotion: Emotion, name: string): void {
+    if (!name)
+      return
+    const group = emotionActionGroups.value[emotion] ?? []
+    if (group.includes(name))
+      return
+    emotionActionGroups.value = { ...emotionActionGroups.value, [emotion]: [...group, name] }
+  }
+
+  function removeEmotionAction(emotion: Emotion, name: string): void {
+    const group = emotionActionGroups.value[emotion] ?? []
+    emotionActionGroups.value = { ...emotionActionGroups.value, [emotion]: group.filter(item => item !== name) }
+  }
+
+  function addFallbackAction(name: string): void {
+    if (!name || fallbackActionGroup.value.includes(name))
+      return
+    fallbackActionGroup.value = [...fallbackActionGroup.value, name]
+  }
+
+  function addIdleAction(name: string): void {
+    if (!name || idleActionGroup.value.includes(name))
+      return
+    idleActionGroup.value = [...idleActionGroup.value, name]
+  }
+
+  function removeFromGroup(target: typeof fallbackActionGroup, name: string): void {
+    target.value = target.value.filter(item => item !== name)
+  }
+
+  function removeFallbackAction(name: string): void {
+    removeFromGroup(fallbackActionGroup, name)
+  }
+
+  function removeIdleAction(name: string): void {
+    removeFromGroup(idleActionGroup, name)
+  }
 
   // === Morphs ===
   /** Manual morph-slot → morph-name overrides for non-standard models. */
@@ -272,9 +360,17 @@ export const useMMD = defineStore('mmd', () => {
     albedoGlow.reset()
     renderScale.reset()
     idleMotionName.reset()
+    normalizeRootMotion.reset()
     void clearMotions()
     oneShotAction.value = undefined
     emotionActionMap.reset()
+    emotionActionGroups.reset()
+    fallbackActionGroup.reset()
+    idleRandomEnabled.reset()
+    idleActionGroup.reset()
+    idleRandomMinSeconds.reset()
+    idleRandomMaxSeconds.reset()
+    speakingGesturesEnabled.reset()
     morphOverrides.reset()
     availableMorphs.reset()
     availableMaterials.reset()
@@ -304,11 +400,24 @@ export const useMMD = defineStore('mmd', () => {
 
     idleMotionName,
     availableMotions,
+    normalizeRootMotion,
     addMotion,
     getMotionFile,
     clearMotions,
     removeMotion,
-    emotionActionMap,
+    emotionActionGroups,
+    fallbackActionGroup,
+    idleRandomEnabled,
+    idleActionGroup,
+    idleRandomMinSeconds,
+    idleRandomMaxSeconds,
+    speakingGesturesEnabled,
+    addEmotionAction,
+    removeEmotionAction,
+    addFallbackAction,
+    removeFallbackAction,
+    addIdleAction,
+    removeIdleAction,
 
     morphOverrides,
     availableMorphs,

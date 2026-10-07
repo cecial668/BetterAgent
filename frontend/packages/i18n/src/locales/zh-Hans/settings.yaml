@@ -1726,6 +1726,20 @@ mmd:
     remove: Remove motion
     description: >-
       Import VMD motion files, set one as the looping idle, or play any as a one-shot gesture. Map emotions to motions to play gestures alongside facial expressions.
+  emotions:
+    title: 情绪动作映射
+    description: >-
+      后端传来一个情绪时，播放这里映射的动作（播完自动回到待机动作）。留空的一项表示那种情绪不做动作。
+    none: （不设置）
+    happy: 开心／得意
+    sad: 低落
+    angry: 生气
+    think: 思考
+    surprised: 惊讶
+    awkward: 尴尬／害羞
+    question: 疑问
+    curious: 好奇
+    neutral: 平静
   morphs:
     title: Morphs
     auto: (auto)

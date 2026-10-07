@@ -111,6 +111,10 @@ async def test_user_profile_manager_config_default_loading():
     mgr._redis_disabled = True
 
     profile = await mgr.get_profile(user_id=123456)
-    assert profile["preferred_name"] == "主人"
+    from shared.config_loader import get_config_val
+
+    expected_default = get_config_val("persona.default_user_name", "你")
+    assert profile["preferred_name"] == expected_default
+    assert profile["preferred_name"] != "主人"
     assert profile["likes"] == []
     assert profile["dislikes"] == []

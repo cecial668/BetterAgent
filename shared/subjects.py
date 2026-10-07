@@ -30,6 +30,16 @@ SUBJECT_TTS_STREAM_END = "agent.tts.stream_end"
 SUBJECT_STREAM_CANCEL_REQ = "agent.stream.cancel_req"
 SUBJECT_STREAM_CANCEL_ACK = "agent.stream.cancel_ack"
 SUBJECT_STREAM_STATE_CHANGE = "agent.stream.state_change"
+# 工具执行进度（目前只有联网搜索用）。Go 侧转成 agent.tool_activity 这个 WS 帧，
+# 前端据此显示「正在查阅资料…」这类瞬时提示 —— 它是工具级事件，不是对话状态机的
+# 状态，所以不能塞进 SUBJECT_STREAM_STATE_CHANGE。
+SUBJECT_TOOL_ACTIVITY = "agent.tool.activity"
+
+# 数字人写入提议（确认框）事件：cognitive_engine 捕获到提议后发布，Go 转发为
+# WS 帧 `agent.life_proposal`，前端渲染成可查看详情 / 手动编辑 / 确认或取消的
+# 弹窗；用户的决定以哨兵文本走正常 user.text 回传（见
+# cognitive_engine.parse_life_decision），保证确认后的语言反馈仍走完整对话管线。
+SUBJECT_LIFE_PROPOSAL = "agent.life.proposal"
 
 # External game events (e.g. Slay the Spike 2 C# mod hook), fed into
 # core/internal/engine/urge_engine.go's Urge accumulator.
@@ -39,6 +49,16 @@ SUBJECT_GAME_EVENT = "agent.game_event"
 # time arrives -- Go Core's WebGateway subscribes and turns it into a
 # proactive LLM turn via engine.PublishProactiveTurn.
 SUBJECT_SCHEDULE_FIRED = "agent.schedule.fired"
+
+# 专注模式（番茄钟）：cognitive_engine 在用户确认/操作后发出 command，
+# Go 的 FocusManager 持有计时真源并广播 state（认知服务缓存后注入提示词，
+# WebGateway 同时转成 agent.focus_state 这个 WS 帧）。
+SUBJECT_FOCUS_COMMAND = "agent.focus.command"
+SUBJECT_FOCUS_STATE = "agent.focus.state"
+
+# 轻量 UI 通知（不经过 LLM、不播报）：如远程模式下暂存的写入补交成功。
+# Go 转发为 WS 帧 agent.notice，前端右下角弹一条低优先级 toast。
+SUBJECT_NOTICE = "agent.notice"
 
 
 def action_decision_subject(channel: str, chat_id: int) -> str:

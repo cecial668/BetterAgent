@@ -19,6 +19,7 @@ import { useVAD } from '@proj-airi/stage-ui/stores/ai/models/vad'
 import { useChatOrchestratorStore } from '@proj-airi/stage-ui/stores/chat'
 import { useBetterAgentGatewayStore } from '@proj-airi/stage-ui/stores/modules/betteragent-gateway'
 import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
+import { useGreetingStore } from '@proj-airi/stage-ui/stores/modules/greeting'
 import { useHearingSpeechInputPipeline } from '@proj-airi/stage-ui/stores/modules/hearing'
 import { useSTS2GameStateStore } from '@proj-airi/stage-ui/stores/modules/sts2-game-state'
 import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
@@ -74,6 +75,9 @@ let stopOnStopRecord: (() => void) | undefined
 
 import { betterAgentWSBridge } from '../bridge/betteragent-ws'
 import { useSTTAudioCapture } from '../composables/stt-audio-capture'
+import AgentNoticeToast from '../components/AgentNoticeToast.vue'
+import FocusTimerWidget from '../components/FocusTimerWidget.vue'
+import LifeProposalDialog from '../components/LifeProposalDialog.vue'
 
 // Expose the bridge as window.__betterAgentWSBridge so that Stage.vue's
 // setInterval audio-chunk poller and chat.ts's streamWithStageAdapters
@@ -83,6 +87,35 @@ import { useSTTAudioCapture } from '../composables/stt-audio-capture'
 if (typeof window !== 'undefined') {
   ;(window as any).__betterAgentWSBridge = betterAgentWSBridge
 }
+
+// 打招呼：每次打开前端网页（含刷新）只发一次；从设置页返回舞台、WS 重连
+// 都不重复触发（store 的 requested 标记），后端还有冷却与忙时守卫兜底。
+// 两个触发点（新连接 onOpen / 挂载时已连接）覆盖了 HMR、路由回退等
+// "connect() 早退后 onOpen 不会再触发"的情况；延迟发送则避开页面刚加载时
+// 上一轮 TTS 尚未回到 IDLE 的窗口，否则后端会因忙时守卫跳过且不会补发。
+const greetingStore = useGreetingStore()
+let greetingTimer: ReturnType<typeof setTimeout> | undefined
+
+function requestGreetingOnce(trigger: 'open' | 'connected') {
+  if (greetingStore.requested)
+    return
+  if (!greetingStore.enabled) {
+    console.info('[greeting] 打招呼开关已关闭，跳过（设置 → 打招呼）')
+    return
+  }
+  greetingStore.markRequested()
+  const awaySeconds = greetingStore.takeAwaySeconds()
+  console.info(`[greeting] 请求打招呼（触发=${trigger}，离开=${awaySeconds ?? '首次'}秒）`)
+  greetingTimer = setTimeout(() => {
+    betterAgentWSBridge.sendGreeting(awaySeconds)
+    console.info('[greeting] user.greeting 已发送')
+  }, 1200)
+}
+
+const unsubscribeGreetingOnOpen = betterAgentWSBridge.onOpen(() => requestGreetingOnce('open'))
+if (betterAgentWSBridge.isConnected())
+  requestGreetingOnce('connected')
+
 betterAgentWSBridge.connect()
 
 // True when the BetterAgent Go WebGateway bridge owns this session (see
@@ -200,6 +233,9 @@ watch(enabled, async (val) => {
 
 onUnmounted(() => {
   stopAudioInteraction()
+  unsubscribeGreetingOnOpen()
+  if (greetingTimer)
+    clearTimeout(greetingTimer)
   betterAgentWSBridge.disconnect()
   if (typeof window !== 'undefined') {
     delete (window as any).__betterAgentWSBridge
@@ -278,6 +314,9 @@ const cursorPosition = computed(() => {
         <MobileInteractiveArea v-if="isMobile" @settings-open="handleSettingsOpen" />
       </div>
       <HoloCoupon />
+      <FocusTimerWidget />
+      <AgentNoticeToast />
+      <LifeProposalDialog />
     </div>
   </BackgroundProvider>
 </template>

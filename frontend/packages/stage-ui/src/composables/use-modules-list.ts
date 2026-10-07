@@ -6,12 +6,17 @@ import { useI18n } from 'vue-i18n'
 
 import factorioIcon from '../assets/factorio-simple.png'
 
+import { getWebSearchConfig } from '../services/betteragent-admin-api'
+
 import { useArtistryStore } from '../stores/modules/artistry'
 import { useConsciousnessStore } from '../stores/modules/consciousness'
 import { useDiscordStore } from '../stores/modules/discord'
 import { useFactorioStore } from '../stores/modules/gaming-factorio'
 import { useMinecraftStore } from '../stores/modules/gaming-minecraft'
+import { useGreetingStore } from '../stores/modules/greeting'
 import { useHearingStore } from '../stores/modules/hearing'
+import { useLanguageModuleStore } from '../stores/modules/language'
+import { useLifeDataStore } from '../stores/modules/life-data'
 import { useSpeechStore } from '../stores/modules/speech'
 import { useTwitterStore } from '../stores/modules/twitter'
 import { useVisionStore } from '../stores/modules/vision'
@@ -36,6 +41,9 @@ export function useModulesList() {
   const consciousnessStore = useConsciousnessStore()
   const speechStore = useSpeechStore()
   const hearingStore = useHearingStore()
+  const languageModuleStore = useLanguageModuleStore()
+  const lifeDataStore = useLifeDataStore()
+  const greetingStore = useGreetingStore()
   const visionStore = useVisionStore()
   const discordStore = useDiscordStore()
   const twitterStore = useTwitterStore()
@@ -45,6 +53,12 @@ export function useModulesList() {
   const artistryStore = useArtistryStore()
   const beatSyncState = ref<BeatSyncDetectorState>()
   const beatSyncSupported = isBeatSyncSupported()
+
+  // 联网搜索页现在直连 admin 后端（见 components/modules/WebSearch.vue），而
+  // webSearchStore.configured 读的是 AIRI 上游那个只写 localStorage 的 module store
+  // —— 那个 Key 只有浏览器自己看得见，对本项目从来没有任何作用。卡片状态若继续只
+  // 看它，就会出现"卡片说未配置、点进去说已就绪"的自相矛盾，所以这里以后台为准。
+  const webSearchBackendConfigured = ref(false)
 
   minecraftStore.initialize()
 
@@ -77,6 +91,19 @@ export function useModulesList() {
       category: 'essential',
     },
     {
+      // BetterAgent-local module (no upstream AIRI equivalent): lip-sync mode
+      // and related speech-appearance settings. Hardcoded Chinese name on
+      // purpose -- adding keys to every upstream locale file just for this
+      // fork-local module would be churn for no user-visible gain.
+      id: 'language',
+      name: '语言模块',
+      description: '口型同步与说话表现的本地设置',
+      icon: 'i-solar:chat-round-dots-bold-duotone',
+      to: '/settings/modules/language',
+      configured: languageModuleStore.configured,
+      category: 'essential',
+    },
+    {
       id: 'vision',
       name: t('settings.pages.modules.vision.title'),
       description: t('settings.pages.modules.vision.description'),
@@ -86,12 +113,35 @@ export function useModulesList() {
       category: 'essential',
     },
     {
+      // BetterAgent-local module（fork 本地页，名称固定中文，理由同语言模块）。
+      // 卡片圆点以后台配置为准：联动开关真的打开才算"已配置"。
+      id: 'life-data',
+      name: '生活数据（向着星）',
+      description: '她能看到、能改动哪些生活数据，以及主动提及策略',
+      icon: 'i-solar:notebook-bold-duotone',
+      to: '/settings/modules/life-data',
+      configured: lifeDataStore.configured,
+      category: 'essential',
+    },
+    {
+      // BetterAgent-local module（fork 本地页，名称固定中文，理由同语言模块）。
+      // 开关存浏览器本地：触发动作发生在前端页面打开时，与后端配置无关。
+      id: 'greeting',
+      name: '打招呼',
+      description: '打开前端页面时让她主动说一句问候（寒暄 / 今日安排 / 久别提醒）',
+      icon: 'i-solar:chat-line-bold-duotone',
+      to: '/settings/modules/greeting',
+      configured: greetingStore.enabled,
+      category: 'essential',
+    },
+    {
       id: 'web-search',
       name: t('settings.pages.modules.web-search.title'),
       description: t('settings.pages.modules.web-search.description'),
       icon: 'i-solar:magnifer-bold-duotone',
       to: '/settings/modules/web-search',
-      configured: webSearchStore.configured,
+      // 卡片上那个"已配置"圆点：后台真的能联网（开关开 + Key 已填）才算数。
+      configured: webSearchStore.configured || webSearchBackendConfigured.value,
       category: 'essential',
     },
     {
@@ -199,6 +249,14 @@ export function useModulesList() {
 
   // TODO(Makito): We can make this a reactive value from a synthetic store.
   onMounted(() => {
+    // 后台不可达时保持"未配置"，与联网搜索页里那条"连不上后台"的提示口径一致。
+    getWebSearchConfig()
+      .then(cfg => webSearchBackendConfigured.value = !!(cfg?.enabled && cfg?.key_set))
+      .catch(() => {})
+
+    // 生活数据卡片同理：以后台 integration.tothestars.enabled 为准。
+    lifeDataStore.load().catch(() => {})
+
     if (!beatSyncSupported)
       return
 

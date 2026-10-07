@@ -11,7 +11,7 @@
 
 import type { SkinnedMesh } from 'three'
 
-import type { GazeOffset, MMDAnimationManager, MorphController } from '../../composables/mmd'
+import type { EnvelopeEvent, GazeOffset, MMDAnimationManager, MorphController, VisemeEvent } from '../../composables/mmd'
 import type { ResolvedMMDModel } from '../../utils/mmd-loader'
 
 import { errorMessageFrom } from '@moeru/std'
@@ -49,6 +49,7 @@ import {
 import { Emotion, EMOTION_VALUES } from '../../constants/emotions'
 import { useMMD } from '../../stores/mmd'
 import { loadMMDModelFromSource } from '../../utils/mmd-loader'
+import { pickMotionFromGroup, nextIdleDelayMs } from '../../utils/motion-group'
 import {
   applyMMDMaterialOpacity,
   collectMMDMaterials,
@@ -62,10 +63,45 @@ const props = withDefaults(defineProps<{
   paused?: boolean
   cursorPosition?: { x: number, y: number }
   currentAudioSource?: AudioBufferSourceNode
+  /**
+   * Server viseme timeline (AudioContext-clock absolute times) pushed by the
+   * BetterAgent TTS pipeline; when present, drives discrete vowel mouth shapes
+   * in preference to the audio-formant analyser.
+   */
+  visemeSchedule?: VisemeEvent[]
+  /**
+   * ~50ms RMS frames of every scheduled audio buffer (wall-clock times),
+   * computed by Stage.vue from the decoded buffers. Primary driver for audio
+   * lip-sync mode -- unlike Web Audio analyser graphs, this can never read
+   * silence while audio is actually playing.
+   */
+  audioEnvelope?: EnvelopeEvent[]
+  /**
+   * Which driver moves the mouth (语言模块 setting):
+   * - 'viseme' (default): discrete, cutscene-like shapes from the server timeline.
+   * - 'audio': continuous formant analysis of the audio being played.
+   * The formant analyser is also the automatic fallback whenever no viseme
+   * timeline exists (frontend TTS, or utterances without visemes).
+   */
+  lipSyncMode?: 'viseme' | 'audio'
+  /**
+   * The AudioContext the stage plays through. Lip-sync analysis MUST run on
+   * this exact instance; using this package's own store copy of it can end up
+   * on a second AudioContext where connect() silently fails and the analyser
+   * hears nothing.
+   */
+  audioContext?: AudioContext
   enableOrbitControls?: boolean
+  /**
+   * 她是否正在说话。待机随机动作会在说话期间暂停——演绎动作与待机小动作
+   * 同时触发会互相打断，观感很乱。
+   */
+  speaking?: boolean
 }>(), {
   paused: false,
+  lipSyncMode: 'viseme',
   enableOrbitControls: false,
+  speaking: false,
 })
 
 const emit = defineEmits<{
@@ -85,10 +121,17 @@ const {
   scale,
   rotationY,
   morphOverrides,
-  emotionActionMap,
+  emotionActionGroups,
+  fallbackActionGroup,
+  idleRandomEnabled,
+  idleActionGroup,
+  idleRandomMinSeconds,
+  idleRandomMaxSeconds,
+  speakingGesturesEnabled,
   materialOpacity,
   idleMotionName,
   availableMotions,
+  normalizeRootMotion,
   oneShotAction,
   cameraFov,
   ambientColor,
@@ -124,9 +167,19 @@ let rafHandle = 0
 // is fed the live audio source and applied to whichever morphs are mounted.
 const audioRef = shallowRef<AudioBufferSourceNode | undefined>(props.currentAudioSource)
 watch(() => props.currentAudioSource, v => audioRef.value = v)
-const lipSync = useMMDLipSync(audioRef)
+const lipSync = useMMDLipSync(audioRef, props.audioContext)
 const blink = useMMDBlink()
 let gaze: ReturnType<typeof createGazeController> | undefined
+
+/**
+ * Stage.vue hands every BetterAgent audio chunk it schedules here, so the
+ * audio-driven lip-sync mode has real signal to analyse while the chunks play
+ * back-to-back (the single currentAudioSource prop only ever holds the last
+ * scheduled chunk).
+ */
+function attachAudioSource(node: AudioBufferSourceNode) {
+  lipSync.attachAudioNode(node)
+}
 
 function canvasElement() {
   return canvasRef.value
@@ -276,7 +329,18 @@ function renderLoop() {
     // over any VMD mouth/expression keyframes.
     emote?.update(delta)
     blink.update(morphs, delta)
-    lipSync.update(morphs, delta)
+    // Driver selection (语言模块 settings). Audio mode prefers the RMS
+    // envelope timeline (computed from the scheduled buffers, so it always
+    // has data); the analyser path stays as a secondary fallback. Viseme mode
+    // uses the server timeline with the analyser as fallback for utterances
+    // without visemes (frontend TTS, ...).
+    if (props.lipSyncMode === 'audio') {
+      if (!lipSync.updateFromEnvelope(morphs, props.audioEnvelope, delta))
+        lipSync.update(morphs, delta)
+    }
+    else if (!lipSync.updateFromVisemes(morphs, props.visemeSchedule, delta)) {
+      lipSync.update(morphs, delta)
+    }
     // Gaze rotates eye/head bones, also after the helper.
     gaze?.update(resolveGazeOffset(), delta)
   }
@@ -309,6 +373,84 @@ function disposeModel() {
   mmdStore.isModelLoaded = false
 }
 
+// ---------- 待机随机动作 ----------
+
+let idleMotionTimer: ReturnType<typeof setTimeout> | undefined
+let lastIdleMotion: string | undefined
+let idleRemainingMs = 0
+let idleDeadline = 0
+
+function clearIdleMotionTimer() {
+  if (idleMotionTimer) {
+    clearTimeout(idleMotionTimer)
+    idleMotionTimer = undefined
+  }
+}
+
+function hasIdleCandidates() {
+  return idleRandomEnabled.value && idleActionGroup.value.length > 0 && registeredMotions.size > 0
+}
+
+/**
+ * 排下一次待机动作。计时只在"没在说话"时走：
+ * 说话时暂停（记住剩余时间），说完继续，而不是从头重新倒计时——
+ * 否则聊天越频繁动作越不触发。
+ * 下一次触发从上一个动作播完后起算（动作时长 + 随机停顿）。
+ */
+function scheduleIdleMotion(delayMs?: number) {
+  clearIdleMotionTimer()
+  if (!hasIdleCandidates())
+    return
+
+  const delay = delayMs ?? nextIdleDelayMs({
+    minSeconds: idleRandomMinSeconds.value,
+    maxSeconds: idleRandomMaxSeconds.value,
+  })
+  idleRemainingMs = Math.max(0, delay)
+
+  if (props.speaking)
+    return
+
+  idleDeadline = Date.now() + idleRemainingMs
+  idleMotionTimer = setTimeout(fireIdleMotion, idleRemainingMs)
+}
+
+/** 暂停倒计时（说话开始），保留剩余时间。 */
+function pauseIdleMotion() {
+  if (!idleMotionTimer)
+    return
+  idleRemainingMs = Math.max(0, idleDeadline - Date.now())
+  clearIdleMotionTimer()
+}
+
+/** 继续倒计时（说话结束）。 */
+function resumeIdleMotion() {
+  if (idleMotionTimer || !hasIdleCandidates())
+    return
+  scheduleIdleMotion(idleRemainingMs)
+}
+
+function fireIdleMotion() {
+  idleMotionTimer = undefined
+  idleDeadline = 0
+  if (props.speaking || !hasIdleCandidates())
+    return
+
+  const name = pickMotionFromGroup(idleActionGroup.value, Array.from(registeredMotions), lastIdleMotion)
+  let actionDurationMs = 0
+  if (name) {
+    lastIdleMotion = name
+    actionDurationMs = (animation?.getClipDuration(name) ?? 0) * 1000
+    animation?.playAction(name, { loop: false })
+  }
+
+  scheduleIdleMotion(nextIdleDelayMs({
+    minSeconds: idleRandomMinSeconds.value,
+    maxSeconds: idleRandomMaxSeconds.value,
+    actionDurationMs,
+  }))
+}
+
 /**
  * Loads and registers any imported VMD motions not yet bound to the current
  * model, then (re)applies the selected idle motion. Safe to call repeatedly;
@@ -331,7 +473,9 @@ async function syncMotions() {
       }
       const url = URL.createObjectURL(file)
       try {
-        const clip = await loadMMDAnimationClip(url, mesh)
+        const clip = await loadMMDAnimationClip(url, mesh, undefined, {
+          normalizeRootMotion: normalizeRootMotion.value,
+        })
         animation.registerClip(descriptor.name, clip)
         registeredMotions.add(descriptor.name)
         if (clip.tracks.length === 0) {
@@ -353,6 +497,8 @@ async function syncMotions() {
 
   if (idleMotionName.value && registeredMotions.has(idleMotionName.value))
     animation.setIdleMotion(idleMotionName.value)
+
+  scheduleIdleMotion()
 }
 
 async function loadModel(src: string) {
@@ -413,14 +559,87 @@ async function loadModel(src: string) {
   }
 }
 
-/** Plays the gesture motion mapped to an emotion, if the model has one. */
+/** Plays a random gesture from the emotion's motion group (fallback group when empty). */
+let lastEmotionMotion: string | undefined
+/** 最近一次情绪；说话持续动作会沿用它在整段台词里接着随机播。 */
+let activeEmotion: Emotion = Emotion.Neutral
+
+// ---------- 说话持续动作（与待机随机动作互相独立） ----------
+
+let speakingGestureTimer: ReturnType<typeof setTimeout> | undefined
+let speakingGestureStartedAt = 0
+let speakingGestureDurationMs = 0
+
+function clearSpeakingGestureTimer() {
+  if (speakingGestureTimer) {
+    clearTimeout(speakingGestureTimer)
+    speakingGestureTimer = undefined
+  }
+}
+
+/** 从情绪动作组（空则通用备选组）随机取一个动作；组都没有可用动作时返回 undefined。 */
+function pickEmotionMotion(emotion: Emotion): string | undefined {
+  const available = Array.from(registeredMotions)
+  const name = pickMotionFromGroup(emotionActionGroups.value[emotion], available, lastEmotionMotion)
+    ?? pickMotionFromGroup(fallbackActionGroup.value, available)
+  if (name)
+    lastEmotionMotion = name
+  return name
+}
+
+/** 播一个情绪手势并记录节拍，返回动作时长（毫秒）。 */
+function playEmotionGesture(emotion: Emotion): { played: boolean, durationMs: number } {
+  const name = pickEmotionMotion(emotion)
+  const durationMs = name ? (animation?.getClipDuration(name) ?? 0) * 1000 : 0
+  if (name)
+    animation?.playAction(name, { loop: false })
+  speakingGestureStartedAt = Date.now()
+  speakingGestureDurationMs = durationMs
+  return { played: Boolean(name), durationMs }
+}
+
+/**
+ * 说话持续动作：说话期间从当前情绪的动作组里一个接一个随机播，
+ * 动作播完只停 0.4~1.2 秒；台词有多长就演多长。与待机随机动作互相独立
+ * （说话时待机调度暂停），开关是「说话时持续动作」。
+ */
+function scheduleSpeakingGesture() {
+  clearSpeakingGestureTimer()
+  if (!speakingGesturesEnabled.value || !props.speaking)
+    return
+  const elapsed = Date.now() - speakingGestureStartedAt
+  const remaining = Math.max(0, speakingGestureDurationMs - elapsed) + 400 + Math.random() * 800
+  speakingGestureTimer = setTimeout(fireSpeakingGesture, remaining)
+}
+
+function fireSpeakingGesture() {
+  speakingGestureTimer = undefined
+  if (!speakingGesturesEnabled.value || !props.speaking)
+    return
+  const { played } = playEmotionGesture(activeEmotion)
+  if (!played)
+    return
+  scheduleSpeakingGesture()
+}
+
 function setEmotion(emotion: string, intensity = 1) {
   const value = EMOTION_VALUES.includes(emotion as Emotion) ? emotion as Emotion : Emotion.Neutral
-  emote?.setEmotion(value, intensity)
+  activeEmotion = value
+  const { durationMs } = playEmotionGesture(value)
 
-  const actionName = emotionActionMap.value[value]
-  if (actionName)
-    animation?.playAction(actionName, { loop: false })
+  // Hold the expression for as long as its gesture runs, then blend back to
+  // neutral. MMD expressions never decay on their own, so without this a
+  // single "happy" would leave the face frozen -- on Genshin-derived models
+  // 笑い is an *eye* morph, so the eyes would stay squeezed shut until some
+  // later emotion happened to replace it.
+  //
+  // The 3s fallback covers emotions with no motion mapped (matching the VRM
+  // timeout) and single-pose VMDs, whose clips report a 0s duration.
+  const holdSeconds = durationMs > 0 ? durationMs / 1000 : 3
+  emote?.setEmotionWithResetAfter(value, holdSeconds * 1000, intensity)
+
+  if (props.speaking)
+    scheduleSpeakingGesture()
 }
 
 let resizeObserver: ResizeObserver | undefined
@@ -440,6 +659,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   cancelAnimationFrame(rafHandle)
+  clearIdleMotionTimer()
+  clearSpeakingGestureTimer()
   resizeObserver?.disconnect()
   disposeModel()
   controls?.dispose()
@@ -495,10 +716,40 @@ watch(availableMotions, () => {
   void syncMotions()
 }, { deep: true })
 
+// 根骨骼归一化开关变化时重新加载全部动作：已注册的旧 clip 需要重建，
+// 否则要到下次刷新/重新导入才会生效。
+watch(normalizeRootMotion, () => {
+  registeredMotions.clear()
+  void syncMotions()
+})
+
 // Idle-motion selection from the settings panel.
 watch(idleMotionName, (name) => {
   if (name && registeredMotions.has(name))
     animation?.setIdleMotion(name)
+})
+
+// 待机随机动作：设置变化重排；说话只暂停/续跑，不重置倒计时。
+watch(
+  [idleRandomEnabled, idleActionGroup, idleRandomMinSeconds, idleRandomMaxSeconds],
+  () => scheduleIdleMotion(),
+  { deep: true },
+)
+watch(() => props.speaking, (speaking) => {
+  if (speaking) {
+    pauseIdleMotion()
+    scheduleSpeakingGesture()
+  }
+  else {
+    clearSpeakingGestureTimer()
+    resumeIdleMotion()
+  }
+})
+watch(speakingGesturesEnabled, () => {
+  if (props.speaking)
+    scheduleSpeakingGesture()
+  else
+    clearSpeakingGestureTimer()
 })
 
 // Scene settings — lighting.
@@ -539,6 +790,7 @@ watch(materialOpacity, () => {
 }, { deep: true })
 
 defineExpose({
+  attachAudioSource,
   canvasElement,
   captureFrame,
   setEmotion,

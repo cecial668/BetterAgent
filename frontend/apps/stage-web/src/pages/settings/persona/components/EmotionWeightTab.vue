@@ -22,15 +22,15 @@ watch(
 
 const personalityDescription = computed(() => {
   if (tsundereWeight.value > 75 && clingyWeight.value > 75) {
-    return '【超级傲娇重度粘人】：嘴上极其毒舌/高傲，但时刻黏在主人身边不肯离开。'
+    return '【超级傲娇重度粘人】：嘴上极其毒舌/高傲，但时刻黏在对方身边不肯离开。'
   }
   if (tsundereWeight.value > 70) {
-    return '【典型傲娇猫娘】：面对称赞嘴硬反驳（才没有很高兴呢喵！），但眼神暗藏欢喜。'
+    return '【典型傲娇】：面对称赞嘴硬反驳（才没有很高兴呢！），但眼神暗藏欢喜。'
   }
   if (clingyWeight.value > 70) {
-    return '【贴贴直球猫娘】：性格温顺依赖，喜欢主动索要安抚与抱抱。'
+    return '【贴贴直球型】：性格温顺依赖，喜欢主动索要安抚与抱抱。'
   }
-  return '【均衡性格猫娘】：傲娇与粘人比例适中，自然随性。'
+  return '【均衡性格】：傲娇与粘人比例适中，自然随性。'
 })
 
 async function handleSave() {

@@ -75,7 +75,7 @@ async def main():
                     chat_id=req.chat_id,
                     user_id=req.user_id,
                     short_term_history=[],
-                    user_profile={"preferred_name": "主人"},
+                    user_profile={},
                     rag_facts=[],
                     current_emotion=req.emotion_description,
                     inbound_message=req.inbound_message,

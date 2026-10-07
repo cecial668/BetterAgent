@@ -208,7 +208,7 @@ func (e *EmotionalState) ToPromptDescription() string {
 
 	isJealous := e.JealousyLevel > 0.3
 	return fmt.Sprintf(
-		"[猫娘内心状态] 当前心情: %s (愉悦度: %.2f, 激动度: %.2f, 亲密度: %.1f, 精力: %.2f, 饱腹感: %.2f, 社交电量: %.2f, 吃醋中: %v)",
+		"[当前内心状态] 当前心情: %s (愉悦度: %.2f, 激动度: %.2f, 亲密度: %.1f, 精力: %.2f, 饱腹感: %.2f, 社交电量: %.2f, 吃醋中: %v)",
 		e.CurrentMoodTag, e.Valence, e.Arousal, e.AffectionLevel, e.Energy, e.Satiety, e.SocialBattery, isJealous,
 	)
 }

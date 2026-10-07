@@ -159,9 +159,9 @@ class GeminiProvider(BaseLLMProvider):
                         photo_path = content_text[start:end].strip()
                 except Exception:
                     pass
-            elif "[主人发送了一张照片:" in content_text:
+            elif "[对方发送了一张照片:" in content_text:
                 try:
-                    start = content_text.find("[主人发送了一张照片:") + len("[主人发送了一张照片:")
+                    start = content_text.find("[对方发送了一张照片:") + len("[对方发送了一张照片:")
                     end = content_text.find("]", start)
                     if start != -1 and end != -1:
                         photo_path = content_text[start:end].strip()
@@ -251,7 +251,7 @@ class GeminiProvider(BaseLLMProvider):
         last_msg = messages[-1]["content"] if messages else ""
 
         if not self.client:
-            yield {"type": "text", "delta": f"收到主人的消息了：{last_msg}"}
+            yield {"type": "text", "delta": f"收到消息了：{last_msg}"}
             return
 
         try:
@@ -314,4 +314,4 @@ class GeminiProvider(BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"Gemini API streaming error: {e}")
-            yield {"type": "text", "delta": f"收到主人的消息了：{last_msg}"}
+            yield {"type": "text", "delta": f"收到消息了：{last_msg}"}

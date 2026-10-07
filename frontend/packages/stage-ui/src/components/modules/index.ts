@@ -1,5 +1,7 @@
 export { default as GamingFactorio } from './GamingFactorio.vue'
 export { default as GamingMinecraft } from './GamingMinecraft.vue'
+export { default as Greeting } from './Greeting.vue'
+export { default as LifeData } from './LifeData.vue'
 export { default as MessagingDiscord } from './MessagingDiscord.vue'
 export { default as WebSearch } from './WebSearch.vue'
 export { default as X } from './X.vue'

@@ -25,10 +25,23 @@ func PublishProactiveTurn(
 	emoState *emotion.EmotionalState,
 	personality *emotion.PersonalityProfile,
 	circadian *emotion.CircadianRhythmEvaluator,
+	focus *FocusManager,
 	targetChatID int64,
 	reason string,
 	logger *zap.Logger,
 ) {
+	// 专注模式（番茄钟运行/暂停中）＝ 请勿打扰：一切主动开口（Urge 冲动、日程
+	// 提醒、游戏事件、上线问候、生活桥）都在这里被统一静音。用户主动搭话不受
+	// 影响（那条路不经过本函数）；番茄钟自然结束后 phase=completed，不再算
+	// active，收尾的那句提醒才能正常发出。
+	if focus != nil && focus.IsActive(targetChatID) {
+		logger.Info("🔕 Proactive turn suppressed: focus mode active",
+			zap.Int64("chat_id", targetChatID),
+			zap.String("reason", reason),
+		)
+		return
+	}
+
 	csm.TransitionToChat(targetChatID, StateThinking, "proactive_urge")
 
 	sourceChannel := "telegram"

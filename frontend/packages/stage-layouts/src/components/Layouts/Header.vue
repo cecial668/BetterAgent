@@ -6,7 +6,7 @@ import HeaderAvatar from './HeaderAvatar.vue'
 import HeaderLink from './HeaderLink.vue'
 import ActionAbout from './InteractiveArea/Actions/About.vue'
 import ActionEmotion from './InteractiveArea/Actions/Emotion.vue'
-import ActionFeedTuna from './InteractiveArea/Actions/ActionFeedTuna.vue'
+import ActionLife from './InteractiveArea/Actions/Life.vue'
 import ActionSchedule from './InteractiveArea/Actions/Schedule.vue'
 
 const router = useRouter()
@@ -53,9 +53,9 @@ function handleNavigation() {
       >
         <div class="i-solar:leaf-bold-duotone h-5 w-5" />
       </RouterLink>
+      <ActionLife />
       <ActionSchedule />
       <ActionEmotion />
-      <ActionFeedTuna />
       <ActionAbout />
       <ProfileSwitcherPopover @manage="handleNavigation" />
       <HeaderAvatar />

@@ -43,7 +43,7 @@ onUnmounted(() => {
       <!-- Text Status -->
       <div class="status-info">
         <div class="status-title">
-          {{ isVisionActive ? `猫娘观察中 (${currentSource === 'screen' ? '屏幕' : '摄像头'})` : '视觉感知已关闭' }}
+          {{ isVisionActive ? `角色观察中 (${currentSource === 'screen' ? '屏幕' : '摄像头'})` : '视觉感知已关闭' }}
         </div>
         <div class="status-sub">
           {{ isVisionActive ? statusMessage : '按 Alt + V 快捷开启/隐藏' }}

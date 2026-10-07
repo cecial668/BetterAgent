@@ -10,6 +10,7 @@ import { useI18n } from 'vue-i18n'
 
 import SystemPromptV2 from '../../constants/prompts/system-v2'
 
+import { BUILTIN_FURINA_CARD_ID, buildBuiltinFurinaCard } from '../../constants/builtin-airi-cards'
 import { DEFAULT_ARTISTRY_WIDGET_SPAWNING_PROMPT } from '../../constants/prompts/character-defaults'
 import { captureAnalyticsEvent } from '../analytics/client'
 import { useSettingsStageModel } from '../settings/stage-model'
@@ -35,6 +36,25 @@ function resolveSystemPrompt(card: AiriCard | undefined): string {
   ].filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
 
   return systemPromptParts.join('\n\n')
+}
+
+/** 内置角色卡只种一次：用户手动删除后不再自动长回来。 */
+const BUILTIN_CARD_SEEDED_KEY = 'ba-builtin-airi-card-seeded'
+
+function builtinCardSeeded(): boolean {
+  try {
+    return localStorage.getItem(BUILTIN_CARD_SEEDED_KEY) === '1'
+  }
+  catch {
+    return false
+  }
+}
+
+function markBuiltinCardSeeded() {
+  try {
+    localStorage.setItem(BUILTIN_CARD_SEEDED_KEY, '1')
+  }
+  catch {}
 }
 
 export const useAiriCardStore = defineStore('airi-card', () => {
@@ -307,6 +327,14 @@ export const useAiriCardStore = defineStore('airi-card', () => {
       }))
     }
 
+    // 内置「芙宁娜」角色卡：首次启动写入一次，让角色卡界面能直接看到她；
+    // 用户手动删除后（以及此后再启动）都不会自动重建。
+    if (!builtinCardSeeded()) {
+      if (!cards.value.has(BUILTIN_FURINA_CARD_ID))
+        cards.value.set(BUILTIN_FURINA_CARD_ID, newAiriCard(buildBuiltinFurinaCard()))
+      markBuiltinCardSeeded()
+    }
+
     // The active id and card map are persisted separately. Older versions
     // could delete the selected card without repairing its stored id.
     if (!cards.value.has(activeCardId.value))
@@ -353,6 +381,21 @@ export const useAiriCardStore = defineStore('airi-card', () => {
       if (extension.modules.artistry.options)
         artistryStore.providerOptions = extension.modules.artistry.options
     }
+  }
+
+  // 自愈：历史版本的内置芙宁娜卡把后端 TTS provider（gpt_sovits）写进了卡片，
+  // 前端 provider 注册表不认识它 —— 会在下面的激活 watcher 里直接抛
+  // "Provider metadata for gpt_sovits not found" 把整页打崩，且 initialize()
+  // 可能根本来不及跑。所以必须在注册 watcher *之前* 就地修好；如果激活那一下
+  // 已经把坏 provider 持久化进了语音 store，也一并清掉（空值 = 未选择，安全）。
+  {
+    const backendOnlyProviders = new Set(['gpt_sovits', 'cosyvoice'])
+    if (backendOnlyProviders.has(activeSpeechProvider.value ?? ''))
+      activeSpeechProvider.value = ''
+
+    const furinaCard = cards.value.get(BUILTIN_FURINA_CARD_ID)
+    if (furinaCard?.extensions?.airi?.modules?.speech?.provider === 'gpt_sovits')
+      cards.value.set(BUILTIN_FURINA_CARD_ID, newAiriCard(buildBuiltinFurinaCard()))
   }
 
   // Activation changes the stable card ID, while card editors replace the

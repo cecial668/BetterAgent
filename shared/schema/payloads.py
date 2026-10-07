@@ -114,6 +114,21 @@ class EmotionDeltaPayload(BasePayload):
     is_jealous: bool = False
 
 
+class EmotionUpdatePayload(BasePayload):
+    """A discrete performance emotion for the avatar renderer.
+
+    Unlike EmotionDeltaPayload -- which nudges the slow VAD mood state and is
+    only ever a delta -- this carries a named emotion from the renderer's fixed
+    vocabulary (happy/sad/angry/think/surprised/awkward/question/curious/
+    neutral). The frontend maps it to a one-shot gesture motion through
+    settings/mmd/emotion-action-map, which is what lets the character gesture
+    in step with what she is saying.
+    """
+    chat_id: int
+    emotion: str
+    action: str = ""
+
+
 class ActionDecisionPayload(BasePayload):
     chat_id: int
     generation_id: int = 1
@@ -200,6 +215,74 @@ class StreamStateChangePayload(BasePayload):
     generation_id: int = 1
     state: str = "IDLE"
     source_channel: str = "web"
+
+
+class ToolActivityPayload(BasePayload):
+    """某个工具正在执行 / 刚执行完的进度信号。
+
+    目前只有联网搜索用到：cognitive_engine 在执行 web_search 之前发一条
+    phase="start"，拿到结果之后再发一条 phase="done"。Go 侧把它转成
+    `agent.tool_activity` 这个 WS 帧，前端据此显示「正在查阅资料…」的呼吸光提示。
+
+    为什么不动用 `agent.state_change`：那是 Go 侧 CSM 状态机自己的状态，Python
+    直接改会和状态机打架；而且"正在查资料"是**工具级的瞬时事件**，不是对话状态。
+
+    `label` 是人设化文案，由角色卡里的 web_search.searching 决定（见
+    shared/web_search_persona.py），所以前端不需要自己拼"正在搜索…"这种出戏的字。
+    """
+
+    chat_id: int
+    tool: str                    # "web_search"
+    phase: str = "start"         # "start" | "done"
+    label: str = ""              # 人设化文案，如「正在翻手机查资料…」
+
+
+class LifeProposalPayload(BasePayload):
+    """数字人写入提议（确认框）事件。
+
+    phase 语义：
+      - pending:    提议刚生成，前端弹出「需要确认」框
+      - executing:  用户已点确认，正在写入（前端把按钮置为"执行中"）
+      - executed / failed: 写入结果（message 直接展示给用户与模型）
+      - cancelled / expired: 用户取消 / 超时或答非所问导致作废（前端关闭卡片）
+
+    params 是完整的待执行参数，前端据此渲染"查看详情/手动编辑"；用户在框里
+    改动的字段以白名单合并（services/cognitive/tools/tothestars_tool.py 的
+    apply_life_proposal_edits），服务端仍会做最终校验。
+    """
+    chat_id: int
+    proposal_id: str
+    phase: str = "pending"
+    kind: str = ""
+    params: Dict[str, Any] = Field(default_factory=dict)
+    summary: str = ""
+    message: str = ""
+
+
+class FocusCommandPayload(BasePayload):
+    """专注模式（番茄钟）的确定性指令：由 cognitive_engine 在用户确认/操作后发出。
+
+    Go 侧 engine.FocusManager 持有计时的唯一真源；每次指令都会换来一条
+    `agent.focus.state` 广播（NATS 给认知服务做提示词注入，WS 给前端画倒计时）。
+    action 语义：start(minutes) / pause / resume / end。
+    """
+
+    chat_id: int
+    action: str                  # "start" | "pause" | "resume" | "end"
+    minutes: int = 0             # 仅 start 使用，单位分钟
+    outcome: str = ""            # 仅 end 使用："completed" | "abandoned"（信息性）
+
+
+class NoticePayload(BasePayload):
+    """轻量 UI 通知：不经过 LLM、不播报，只给前端弹一条低优先级提示。
+
+    目前用于「远程连接」模式的待提交队列补交成功/放弃：这类结果不需要数字人
+    开口，也不该占用对话轮次，所以单独走 agent.notice → WS agent.notice。
+    """
+
+    level: str = "info"      # "info" | "warn"
+    title: str = "向着星"
+    message: str = ""
 
 
 class GameEventPayload(BasePayload):

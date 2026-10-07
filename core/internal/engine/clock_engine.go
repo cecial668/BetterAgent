@@ -21,6 +21,7 @@ type ClockEngine struct {
 	circadian           *emotion.CircadianRhythmEvaluator
 	urgeEngine          *UrgeEngine
 	autonomousPlayState *AutonomousPlayState
+	focusManager        *FocusManager
 	logger              *zap.Logger
 	counter             int
 	lastTickTime        time.Time
@@ -60,6 +61,12 @@ func (ce *ClockEngine) SetEmotionStore(store *emotion.EmotionalStateStore) {
 	if store != nil {
 		ce.emotionStore = store
 	}
+}
+
+// SetFocusManager wires the focus-mode gate consulted before any proactive
+// turn (see PublishProactiveTurn). Nil keeps the old always-on behaviour.
+func (ce *ClockEngine) SetFocusManager(focus *FocusManager) {
+	ce.focusManager = focus
 }
 
 func (ce *ClockEngine) GetEmotionStore() *emotion.EmotionalStateStore {
@@ -175,7 +182,7 @@ func (ce *ClockEngine) onTick(now time.Time) {
 			}
 
 			if fire, reason := ce.urgeEngine.EvaluateTick(now, elapsed, targetEmo, ce.personality, isSleepHours, targetState, unreadPressure); fire {
-				PublishProactiveTurn(ce.bus, ce.stateMachine, targetEmo, ce.personality, ce.circadian, targetChatID, reason, ce.logger)
+				PublishProactiveTurn(ce.bus, ce.stateMachine, targetEmo, ce.personality, ce.circadian, ce.focusManager, targetChatID, reason, ce.logger)
 			}
 		}
 	}

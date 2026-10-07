@@ -1,4 +1,4 @@
-# BetterAgent (猫娘 Agent) 系统架构与 SRS 规范
+# BetterAgent 系统架构与 SRS 规范
 
 本文档为 `BetterAgent` 项目的文本化架构规范与系统需求说明书（SRS）。所有图纸均使用 **Mermaid** 格式描述，可以直接进行 Git 版本控制与 AI Agent 语义解析，防止设计资产“文档腐化”。
 
@@ -28,7 +28,7 @@ graph TD
         EmotionEngine["EmotionEngine (VAD 3D情绪模型 & 生理指标)"]
         CircadianEvaluator["CircadianRhythm (昼夜生物钟评估器)"]
         UrgeEngine["UrgeEngine (欲望/枯燥度累加器 & 主动开口决策)"]
-        GameEventIngest["GameEventHandler / GameStateHandler (HTTP:8090 / WS)"]
+        GameEventIngest["GameEventHandler / LifeEventHandler / GameStateHandler (HTTP:8090 / WS)"]
         GoNatsBus["NatsBus Client (Go)"]
 
         GotdAdapter --> AntiSpam
@@ -78,8 +78,9 @@ graph TD
             MemoryHub --> TokenBudget
         end
 
-        subgraph Game_Watcher_Service["Game Watcher Service"]
+        subgraph Game_Watcher_Service["Game Watcher / Life Bridge Services"]
             STS2Poller["STS2 Poller (轮询 C# Mod 状态并触发 Game Turn)"]
+            LifeBridge["Life Bridge (轮询向着星快照 -> 生活事件)"]
         end
 
         PyNatsBus --> CognitiveEngine
@@ -97,6 +98,7 @@ graph TD
     WebClient <-->|"WebSocket (全双工)"| WebGateway
     STS2Game <-->|"HTTP:8090 / C# Mod"| GameEventIngest
     STS2Game <-->|"HTTP / Game Tool Calls"| ToolRegistry
+    LifeBridge --"HTTP:8090 /api/life-event"--> GameEventIngest
     
     GoNatsBus <--> NATS
     PyNatsBus <--> NATS
@@ -155,6 +157,12 @@ sequenceDiagram
     GW->>NATS: Publish "agent.action_completed"
     NATS-->>CSM: Notify "agent.action_completed" (状态恢复 IDLE)
 ```
+
+> **页面打开的主动打招呼**：除 `user.text` 外，浏览器还会在每次页面加载时发送一次 `user.greeting`（payload 可带 `away_seconds` = 距上次打开前端的秒数）。Go 侧 `handleUserGreeting` 仅在聊天处于 IDLE / SLEEPING / MOODY_REST 且距上次招呼超过 10 秒时处理，随后复用 `engine.PublishProactiveTurn` 走与 `agent.enrich_context_req` 相同的主动轮推理管线（不新增 NATS 主题、不动状态机）；发起招呼的 session 会被 `MarkActive`，TTS 音频只发给它。浏览器本地开关见设置 → 打招呼。
+
+> **专注模式（番茄钟）**：用户说「我想安静干活一小时」→ 模型调用 `focus_propose_session` → 复用写入确认框弹窗（kind `focus.start`，时长可调）→ 用户点确认后 cognitive_engine 不再走模型决策，而是产出 `FocusCommandPayload` 经 `agent.focus.command` 交给 Go 的 `engine.FocusManager`（计时唯一真源，支持暂停/继续/结束、周期心跳重播；刷新页面后挂件用 `user.focus_status` 拉回剩余时间）。运行/暂停期间所有主动开口（Urge、日程、游戏、上线问候、生活桥）在 `PublishProactiveTurn` 统一被静音；认知服务缓存 `agent.focus.state` 并在每轮注入"专注中"行为约束（对无关话题表现出被打扰的反感，不主动开新话题）。自然结束后挂件弹出「专注总结」表单（分类 + 完成内容），提交以 `【专注】` 哨兵回传，引擎确定性写入向着星 `POST /api/focus/sessions`（X-Actor: companion）并围绕内容让模型收尾鼓励；中途放弃只清状态、不落库。
+
+> **向着星写入通道（`integration.tothestars.write_mode`）**：`local`（默认）在 BetterAgent 进程内把向着星项目根目录加入 `sys.path`，实例化它自己的 `Database` 与 Service/Repo 直接读写其 SQLite —— 业务规则与审计（`agent_audit`，actor=companion）和网页端完全一致，向着星没启动也能写；`remote` 走 HTTP，写失败（连不上/5xx）先落到 `data/tothestars_outbox.json` 待提交队列，认知服务每 10 秒扫一次、按 15s→300s 退避重放，补交成功发 `agent.notice`（前端 toast，不播报）。「专注/番茄钟」是权限矩阵里的独立类目（focus，默认可读写可主动），门控 `focus_propose_session` 与专注记录写入。
 
 ### 2.2 Barge-in 用户打断撤销时序 (Realtime Stream Cancel & Generation Increment)
 
@@ -302,6 +310,8 @@ stateDiagram-v2
 | **视觉与感知** | `agent.vision.frame` / `agent.emotion.delta` | 画面快照 / 动态情绪增量回传 (Cognitive -> Go)（`agent.emotion.update` 目前只有 Go 端订阅、从未有发布方，尚未接通，勿依赖） |
 | **人设与配置** | `agent.persona.update` | 人设热更新广播（YAML 磁盘同步 + PersonaLoader 内存缓存失效） |
 | **游戏感知** | `agent.game_event` | 外部游戏事件广播（稀有圣物、濒死、胜负结算等） |
+| **专注模式** | `agent.focus.command` / `agent.focus.state` | 番茄钟指令与状态：cognitive_engine 在用户确认/操作后发 `FocusCommandPayload`（start/pause/resume/end），Go 的 `engine.FocusManager` 持有计时真源并广播 `FocusState`（认知服务据此注入"专注中"行为约束，WebGateway 同时转成 WS `agent.focus_state` 供倒计时挂件渲染）；运行/暂停期间 `PublishProactiveTurn` 统一静音，用户主动搭话不受影响。详见 2.1 节后的说明 |
+| **轻量通知** | `agent.notice` | `NoticePayload`（level/title/message）→ WS `agent.notice` 广播给所有页面：远程连接模式下暂存的向着星写入补交成功/放弃时的右下角 toast；不经过 LLM、不播报、不动状态机 |
 
 ### 4.2 系统核心总线与适配器 UML 类图 (Core NATS Bus & Multi-Channel Adapters Class Diagram)
 
@@ -533,6 +543,8 @@ classDiagram
     BasePayload <|-- GameEventPayload
     BasePayload <|-- TickPayload
 ```
+
+> `GameEventPayload` 同时承载游戏事件与生活事件：两者共用同一 NATS subject（`agent.game_event`）与同一张配置权重表结构，生活事件的 `game` 固定为 `life`，由 `POST /api/life-event`（独立 `LIFE_EVENT_TOKEN`，与游戏事件同一回环监听 `:8090`）摄入，权重见 `config.yaml` 的 `game_events.games.life`。主动开口的静默时段与每小时/每天上限在 `UrgeEngine.EvaluateTick` 判定（读 `integration.tothestars.proactive`），对所有主动消息（无聊搭话 / 游戏事件 / 生活事件）生效。
 
 ### 4.4 记忆子系统 UML 类图 (Memory Subsystem Class Diagram)
 
@@ -914,7 +926,7 @@ STT 识别本身仍通过 `agent.inbound_message` 进入同一推理链路（只
 
 ### 7.1 Campus KB 校园知识库交互数据流 (Campus KB RAG Flow)
 
-猫娘（BetterAgent）与校园知识库 `services/campus_kb` 的交互采用**预注入 RAG 上下文**与**自主 Tool Calling**双通道机制：
+（BetterAgent）与校园知识库 `services/campus_kb` 的交互采用**预注入 RAG 上下文**与**自主 Tool Calling**双通道机制：
 
 ```mermaid
 sequenceDiagram
@@ -942,6 +954,32 @@ sequenceDiagram
     
     Cog-->>User: 生成包含猫娘口吻与校园知识的最终回复
 ```
+
+### 7.2 联网搜索 web_search 工具 (Web Search Tool, Layer 1)
+
+`services/cognitive/tools/web_search_tool.py` 是一个普通的 `BaseTool`（Tavily 后端），复用与 Campus KB
+完全相同的「自主工具调用 → 结果回灌 → 二次推理」通道，**不新增** NATS subject、payload 字段或状态机迁移。
+
+- **门控（三层，每轮重新求值）**：`CognitiveEngine` 在**每一轮**决定"给模型看哪些工具"时，依次判断
+  ① 全局开关 + API Key（`shared/web_search_config.is_web_search_available()`）；
+  ② **角色卡开关**（`shared/web_search_persona.is_persona_web_search_enabled()`，读 `web_search.enabled`，
+  缺省跟随全局）；③ `tools.web_search.max_calls_per_turn` 是否还有余额。
+  任一不满足，`web_search` 就不进 `tools_schema`，模型无从调用 —— 这比"注册了再在提示词里劝阻"可靠得多。
+  `PromptBuilder` 用**同一组判断函数**决定是否注入联网说明，因此"提示词里有这段"与"模型真能调工具"
+  永远一致（不一致会导致关了联网模型仍想查 → 卡壳，或开着联网模型不知道能查 → 不触发）。
+- **提示词**：`PromptBuilder` 仅在可用时注入「联网搜索能力 + 网页内容安全规则」，与工具输出里的
+  `<untrusted_content>` 信封成对出现，缺一半防护即失效。
+- **注入防护**：网页正文（含标题与出版日期，它们同样由页面控制）一律包进
+  `<untrusted_content source="<sanitized-url>">`；信封外只留 sanitize 过的 URL。页面正文里出现的
+  `</untrusted_content>` 会被中和成全角字符，无法提前闭合信封把后续文字伪装成可信内容。
+- **角色化（Layer 2）**：`web_search.style / alias / missed / framing` 只决定"怎么把查资料说出口"；
+  「该查 / 不该查 / 角色自己的世界一律不查」是写在 `shared/web_search_persona.py` 里的硬规则，
+  角色卡覆盖不了。设置页人设编辑器有「联网能力」tab 与 ⓘ 字段说明面板。
+- **引用**：`facts[].content` 的信封在引擎里由 `strip_untrusted_envelope()` 剥掉后再并入既有
+  `citations` 通道（只用于展示，不进模型上下文），前端「参考资料」面板无需改动。
+- **跨语言依赖**：OpenAI 兼容 Provider（DeepSeek / Qwen / OpenAI）的消息转换必须把
+  `role="model"`+`function_call` 与 `role="user"`+`function_response` 翻译成标准的
+  `assistant.tool_calls` + `role:"tool"` 配对，否则工具结果无法回灌（详见 CHANGELOG.md 的 `Fixed` 段落）。
 
 ---
 

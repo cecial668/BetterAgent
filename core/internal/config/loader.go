@@ -67,6 +67,20 @@ type YAMLConfig struct {
 		DefaultWeight float64                       `yaml:"default_weight"`
 		Games         map[string]map[string]float64 `yaml:"games"`
 	} `yaml:"game_events"`
+	// Integration holds cross-app links. Only the fields Go Core actually
+	// gates on are declared here -- the Python side reads the same YAML
+	// section for its own keys (endpoint, permissions, ...) via
+	// shared/config_loader.py, keeping one source of truth in config.yaml.
+	Integration struct {
+		ToTheStars struct {
+			Proactive struct {
+				Enabled    bool     `yaml:"enabled"`
+				QuietHours []string `yaml:"quiet_hours"`
+				MaxPerHour int      `yaml:"max_per_hour"`
+				MaxPerDay  int      `yaml:"max_per_day"`
+			} `yaml:"proactive"`
+		} `yaml:"tothestars"`
+	} `yaml:"integration"`
 }
 
 type Config struct {
@@ -88,6 +102,10 @@ type Config struct {
 	// Empty disables the endpoint rather than failing startup -- it's an
 	// optional integration, unlike WEBGATEWAY_TOKEN.
 	GameEventToken string
+	// LifeEventToken gates POST /api/life-event (向着星 Life Bridge, see
+	// webgateway/life_event_handler.go). Independent from GameEventToken on
+	// purpose; empty disables the endpoint the same optional way.
+	LifeEventToken string
 	YAML           YAMLConfig
 }
 
@@ -178,6 +196,7 @@ func LoadConfig() *Config {
 		WebGatewayToken:          getEnv("WEBGATEWAY_TOKEN", ""),
 		WebGatewayAllowedOrigins: allowedOrigins,
 		GameEventToken:           getEnv("GAME_EVENT_TOKEN", ""),
+		LifeEventToken:           getEnv("LIFE_EVENT_TOKEN", ""),
 		YAML:                     yc,
 	}
 }

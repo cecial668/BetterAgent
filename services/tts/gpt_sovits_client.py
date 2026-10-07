@@ -19,6 +19,11 @@ def sanitize_text_for_tts(text: str) -> str:
         return text
     text = re.sub(r"\.{2,}", "，", text)
     text = re.sub(r"…+", "，", text)
+    # Em-dashes / dash runs make GPT-SoVITS insert odd pauses (heard as
+    # "some words stretched weirdly"); normalize them to a plain comma.
+    # Single ASCII hyphens are kept so words like "GPT-SoVITS" survive.
+    text = re.sub(r"[—–]+", "，", text)
+    text = re.sub(r"-{2,}", "，", text)
     text = re.sub(r"！{2,}", "！", text)
     text = re.sub(r"？{2,}", "？", text)
     text = re.sub(r"，{2,}", "，", text)
@@ -44,9 +49,20 @@ class GPTSoVITSClient:
     def __init__(self, endpoint: Optional[str] = None):
         self.endpoint = endpoint or get_config_val("tts.gpt_sovits.endpoint", "http://127.0.0.1:19888/tts")
 
-
-
         self.sample_rate = get_config_val("tts.gpt_sovits.sample_rate", 32000)
+        # Fine-tuned FurinaCN defaults (tuned A/B against v2Pro base): moderate
+        # temperature + tighter top_k keep prosody stable, speed_factor 1.05
+        # trims the drawl, repetition_penalty 1.4 suppresses stretched vowels.
+        self.temperature = float(get_config_val("tts.gpt_sovits.temperature", 0.8))
+        self.top_k = int(get_config_val("tts.gpt_sovits.top_k", 10))
+        self.top_p = float(get_config_val("tts.gpt_sovits.top_p", 1.0))
+        self.speed_factor = float(get_config_val("tts.gpt_sovits.speed_factor", 1.05))
+        self.repetition_penalty = float(get_config_val("tts.gpt_sovits.repetition_penalty", 1.4))
+        # cut0 = do NOT split on punctuation: the whole sentence is synthesized
+        # as one segment, so prosody is planned across the full sentence
+        # instead of resetting at every comma. Downstream still slices the PCM
+        # into ~200ms chunks for playback, so nothing else changes.
+        self.text_split_method = str(get_config_val("tts.gpt_sovits.text_split_method", "cut0"))
 
     async def synthesize_stream(
         self, text: str, cancel_event: Optional[Any] = None
@@ -69,13 +85,19 @@ class GPTSoVITSClient:
             "ref_audio_path": os.path.abspath(prompt_audio),
             "prompt_text": prompt_text,
             "prompt_lang": prompt_lang,
-            "top_k": 15,
-            "top_p": 1.0,
-            "temperature": 0.7,
-            "text_split_method": "cut5",
+            "top_k": self.top_k,
+            "top_p": self.top_p,
+            "temperature": self.temperature,
+            "repetition_penalty": self.repetition_penalty,
+            "text_split_method": self.text_split_method,
             "batch_size": 1,
-            "speed_factor": 1.0,
-            "streaming_mode": 1,
+            "speed_factor": self.speed_factor,
+            # One-shot (0), not fragment streaming (1): the server's fragment
+            # mode cuts at semantic-token boundaries and was audible as a
+            # chopped/gated artifact on the FurinaCNFinal fine-tune. The full
+            # sentence PCM still gets sliced into ~200ms chunks downstream by
+            # this client and by the TTS service for gapless browser playback.
+            "streaming_mode": 0,
             "media_type": "raw",
         }
 

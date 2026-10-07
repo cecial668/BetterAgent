@@ -19,6 +19,14 @@ type UserTextMessagePayload struct {
 	ChatID int64  `json:"chat_id,omitempty"`
 }
 
+// UserGreetingPayload accompanies a "user.greeting" frame: the browser reports
+// "this page just opened" so the agent can proactively greet the user.
+// AwaySeconds is how long ago the previous frontend visit ended (browser
+// clock); omitted on a first-ever visit, when there is nothing to compare.
+type UserGreetingPayload struct {
+	AwaySeconds *int64 `json:"away_seconds,omitempty"`
+}
+
 type UserAudioChunkPayload struct {
 	AudioBase64 string `json:"audio_base64"`
 	SampleRate  int    `json:"sample_rate,omitempty"`
@@ -64,6 +72,34 @@ type AdminPersonaUpdatePayload struct {
 	SleepyPrompt    string `json:"sleepy_prompt,omitempty"`
 	KnowledgeScope  string `json:"knowledge_scope,omitempty"`
 	ForbiddenTopics string `json:"forbidden_topics,omitempty"`
+}
+
+// AgentToolActivityPayload carries tool-execution progress to the browser
+// (currently only web_search). Label is the persona-flavoured wording rendered
+// on the Python side from the character card (shared/web_search_persona.py) --
+// the frontend renders it verbatim instead of inventing its own "searching the
+// web..." string, which is what keeps the indicator in-character.
+type AgentToolActivityPayload struct {
+	ChatID int64  `json:"chat_id,omitempty"`
+	Tool   string `json:"tool"`
+	Phase  string `json:"phase"` // "start" | "done"
+	Label  string `json:"label,omitempty"`
+}
+
+// AgentLifeProposalPayload carries a 向着星 write proposal to the browser so it
+// can render the 需要确认 box (details / manual edits / confirm / cancel).
+// Phase lifecycle: pending -> executing -> executed|failed, or
+// pending -> cancelled|expired. Params is the raw pending action payload; the
+// frontend only edits whitelisted business fields and the server re-validates
+// everything on execution (see cognitive_engine.settle + apply_life_proposal_edits).
+type AgentLifeProposalPayload struct {
+	ChatID     int64                  `json:"chat_id,omitempty"`
+	ProposalID string                 `json:"proposal_id"`
+	Phase      string                 `json:"phase"`
+	Kind       string                 `json:"kind,omitempty"`
+	Params     map[string]interface{} `json:"params,omitempty"`
+	Summary    string                 `json:"summary,omitempty"`
+	Message    string                 `json:"message,omitempty"`
 }
 
 type AgentAudioChunkPayload struct {

@@ -6,7 +6,7 @@ type PersonalityProfile struct {
 	TsundereLevel     float64 `json:"tsundere_level"`     // 0.0 - 1.0 (high = cold outside, warm inside)
 	Clinginess        float64 `json:"clinginess"`         // 0.0 - 1.0 (high = wants attention)
 	JealousyThreshold float64 `json:"jealousy_threshold"` // 0.0 - 1.0 (low = jealous easily)
-	CatNature         float64 `json:"cat_nature"`         // 0.0 - 1.0 (high = aloof, fragmented)
+	CatNature         float64 `json:"cat_nature"`         // 0.0 - 1.0 (high = aloof / detached; YAML key kept for compat)
 	Neuroticism       float64 `json:"neuroticism"`         // 0.0 - 1.0 (high = mood swings)
 	Extraversion      float64 `json:"extraversion"`        // 0.0 - 1.0 (high = proactive)
 }
@@ -67,7 +67,7 @@ func (p *PersonalityProfile) ModifySentimentDelta(dV, dA, dAff float64) (float64
 
 func (p *PersonalityProfile) ToPromptDescription() string {
 	return fmt.Sprintf(
-		"[猫娘性格设定] 傲娇度: %.1f, 粘人度: %.1f, 猫性: %.1f, 嫉妒敏感度: %.1f",
+		"[性格参数设定] 傲娇度: %.1f, 粘人度: %.1f, 疏离感: %.1f, 嫉妒敏感度: %.1f",
 		p.TsundereLevel, p.Clinginess, p.CatNature, 1.0-p.JealousyThreshold,
 	)
 }

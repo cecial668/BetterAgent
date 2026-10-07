@@ -111,7 +111,7 @@ export async function fetchMemoryStats(chatId: number = 1001): Promise<MemorySta
 
 function getDefaultFallbackFacts(): UserProfileFact[] {
   return [
-    { fact_id: 'fact_101', chat_id: 1001, user_id: 1, category: 'identity', key: '用户称呼', value: '主人' },
+    { fact_id: 'fact_101', chat_id: 1001, user_id: 1, category: 'identity', key: '用户称呼', value: '旅行者' },
     { fact_id: 'fact_102', chat_id: 1001, user_id: 1, category: 'identity', key: '校园身份', value: '计算机专业应届毕业生' },
     { fact_id: 'fact_103', chat_id: 1001, user_id: 1, category: 'preference', key: '喜好游戏', value: '杀戮尖塔2、二次元手游' },
     { fact_id: 'fact_104', chat_id: 1001, user_id: 1, category: 'preference', key: '常用工具', value: 'AIRI 桌面虚拟主播、BetterAgent' },

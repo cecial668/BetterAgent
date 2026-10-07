@@ -116,6 +116,19 @@ export function createMMDAnimationManager(mmd: MMD, options: MMDAnimationManager
     return Array.from(registry.keys())
   }
 
+  /**
+   * Duration of a registered motion in seconds.
+   *
+   * Lets a caller hold a complementary effect (an emotion's expression morphs,
+   * say) for exactly as long as the motion itself runs instead of guessing a
+   * fixed number.
+   *
+   * @returns `undefined` when no clip is registered under `name`.
+   */
+  function getClipDuration(name: string): number | undefined {
+    return registry.get(name)?.duration
+  }
+
   /** Cross-fades back to the persistent idle loop. */
   function playIdle(crossfade = DEFAULT_CROSSFADE): void {
     if (currentAction)
@@ -253,6 +266,7 @@ export function createMMDAnimationManager(mmd: MMD, options: MMDAnimationManager
     init,
     registerClip,
     availableClips,
+    getClipDuration,
     playIdle,
     playAction,
     setIdleMotion,

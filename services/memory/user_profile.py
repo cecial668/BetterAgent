@@ -55,7 +55,10 @@ class UserProfileManager:
             if now - cached_time < self.CACHE_TTL_SECONDS:
                 return cached_profile
 
-        default_name = get_config_val("persona.default_user_name", "主人")
+        # 默认称呼由 config/config.yaml 的 persona.default_user_name 决定；
+        # 兜底必须是中性的「你」——以前兜底是「主人」，等于给所有人设都塞了
+        # 一个猫娘式的默认称呼。
+        default_name = get_config_val("persona.default_user_name", "你")
         default_profile = {
             "preferred_name": default_name,
             "likes": [],
@@ -129,7 +132,7 @@ class UserProfileManager:
 
     async def get_formatted_profile_prompt(self, user_id: int) -> str:
         profile = await self.get_profile(user_id)
-        pref_name = profile.get("preferred_name", "主人")
+        pref_name = profile.get("preferred_name") or "你"
         likes = profile.get("likes", [])
         dislikes = profile.get("dislikes", [])
 

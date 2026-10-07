@@ -84,7 +84,7 @@ async function handleSave() {
         v-model="basePrompt"
         rows="10"
         class="w-full resize-y rounded-xl border border-neutral-200 bg-neutral-50/50 p-4 text-sm font-mono text-neutral-900 transition-colors focus:border-primary-500 focus:outline-none dark:border-neutral-800 dark:bg-neutral-900/40 dark:text-neutral-100"
-        placeholder="输入猫娘的核心 Base Prompt..."
+        placeholder="输入角色的核心 Base Prompt..."
       />
     </div>
 

@@ -37,7 +37,7 @@
 > 深受 [Project AIRI](https://github.com/moeru-ai/airi) 启发，致力于构建开放、可本地部署、能与用户双向共情的数字人陪伴系统。
 
 > [!TIP]
-> **一键拉起所有微服务**（NATS · Go Core · Cognitive · Memory · TTS · STT · Campus KB · Admin · Companion · Game Watcher）：
+> **一键拉起所有微服务**（NATS · Go Core · Cognitive · Memory · TTS · STT · Campus KB · Admin · Companion · Game Watcher · 向着星 Life Bridge）：
 >
 > ```bash
 > python runner.py
@@ -81,6 +81,23 @@ BetterAgent 是一个课程项目：给一位数字人搭一整套"能听、能�
   <img src="./docs/images/screenshots/live2d-settings.png" width="30%" alt="Live2D 模型自定义配置" />
   <img src="./docs/images/screenshots/admin-panel.png" width="30%" alt="后台管理面板" />
 </p>
+
+### 实机演示 · 数字人本体与《向着星》联动
+
+> 以下四张为最新实机截图：数字人对话界面、情感/生存状态面板，以及与《向着星》联动时的**写入确认弹窗**。
+
+<p align="center">
+  <img src="./docs/images/screenshots/app-chat-1.png" width="30%" alt="数字人对话界面（含实时字幕）" />
+  <img src="./docs/images/screenshots/app-chat-2.png" width="30%" alt="数字人对话界面与 Live2D 动作" />
+  <img src="./docs/images/screenshots/emotion-panel.png" width="30%" alt="情绪指标面板" />
+</p>
+<p align="center">
+  <img src="./docs/images/screenshots/life-proposal-confirm.png" width="45%" alt="向着星联动 · 写入确认弹窗" />
+</p>
+
+- **对话界面**：Live2D 立绘 + 气泡历史 + 底部输入框；说话时浮出「实时字幕」，逐块揭示对齐播放进度。
+- **情绪指标面板**：`好感度 / 精力 / 饱腹度 / 社交电量` 由 VAD 情感模型与生理引擎真实计算，随生物钟衰减、随互动积累，不是写死的数值。
+- **写入确认弹窗**：当她准备改动《向着星》里的生活数据时，先弹出确认框（示例：把委托「健身」标记为已完成），只有点「确认执行」才会落库，并可随时在《向着星》「AI 活动」页一键撤销。
 
 ---
 
@@ -134,6 +151,18 @@ BetterAgent 是一个课程项目：给一位数字人搭一整套"能听、能�
 - [x] 实时游戏状态解析与自动出牌决策
 - [x] Game Watcher Service 轮询与触发
 - [x] 解说 HUD 叠加
+
+### 🔗 生活系统联动（向着星 ToTheStars）
+
+> 与独立运行的个人生活管理应用《向着星》双向联动：她能在你授权的范围内了解你的委托 / 日程 / 长期目标，经你确认后替你写入，并在合适时机主动开口 —— 完整设计（权限模型 / 写入确认 / 审计撤销 / 主动策略）见 [`docs/TOTHESTARS-INTEGRATION-PLAN.md`](docs/TOTHESTARS-INTEGRATION-PLAN.md)。
+
+- [x] 四档权限矩阵（`shared/life_data_permissions.py` 唯一真源）：`hidden` 时工具**根本不进模型可见表**，不是口头劝阻
+- [x] 只读工具族（快照 / 委托 / 日程 / 传说 / 日记摘要）与生活快照提示词注入 + 克制规则（数据当数据、没有的不编造、日记不主动提）
+- [x] **写入确认协议**：模型只看得见 `tothestars_propose_*`（提议工具，零写入），用户确认后由引擎确定性执行；审计可撤销
+- [x] 设置页「生活数据（向着星）」：权限矩阵 + 主动策略，写回 `config.yaml` 并热生效（无需重启）
+- [x] 舞台「生活概览 HUD」：今日委托完成度 / 下一项日程 / 传说进度，一键「让她讲讲今天」
+- [x] 主动层：生活事件桥轮询（晨间简报 / 晚间复盘 / 临期 / 必要未完成 / 连击里程碑）+ 静默时段 + 每小时/每天频率上限
+- [x] 双向微嵌入：向着星侧新增「AI 活动」页（来源标记 / 一键撤销）与右下角对话气泡（未配置 token 时零变化）
 
 ### 🤝 多渠道对话
 
@@ -360,6 +389,7 @@ go test -race ./...   # core/ 目录下
 | [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) | 团队多微服务端口隔离规范、HTTP REST 契约、PR 门控检查清单 |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | 鉴权环境变量配置与生产环境信任边界清单 |
 | [`docs/PORTABLE_PACKAGE.md`](docs/PORTABLE_PACKAGE.md) | 便携版构建与分发指南、覆盖范围与已知限制 |
+| [`docs/TOTHESTARS-INTEGRATION-PLAN.md`](docs/TOTHESTARS-INTEGRATION-PLAN.md) | 与《向着星》联动方案：权限矩阵、写入确认协议、审计撤销、主动策略、接口映射 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 按语义化版本与 Conventional Commits 规范记录的迭代日志 |
 
 ---
@@ -374,6 +404,70 @@ go test -race ./...   # core/ 目录下
   <img src="./docs/images/CognitiveEngine.png" width="49%" alt="CognitiveEngine" />
   <img src="./docs/images/MemoryHub.png" width="49%" alt="MemoryHub" />
 </p>
+
+---
+
+## 联动作品：向着星（ToTheStars）
+
+> **《向着星》是与另一个小组（个人生活管理应用方向）联合开发的联动作品**：应用本身由对方团队主导设计与实现，本项目负责数字人侧的接入与双向联动协议。两套应用各自独立运行、可以单独使用，**不配置联动时双方功能均为零变化**。
+
+《向着星》是一个本地单用户的「每日委托 / 日程 / 番茄钟 / 点数成长」生活管理应用（Python FastAPI + React + SQLite，仅监听 `127.0.0.1`，无云端账户）。源码收录在本仓库 [`agent/ToTheStarsWeb/`](agent/ToTheStarsWeb/)，启动与功能说明见 [`agent/向着星-启动与功能说明书.docx`](agent/向着星-启动与功能说明书.docx) 与 [`agent/ToTheStarsWeb/README.md`](agent/ToTheStarsWeb/README.md)。
+
+### 联动做了什么
+
+- **她读得到**：在授权范围内读取今日委托、日程、传说任务进度、点数与日记摘要，作为「生活快照」注入 System Prompt。
+- **她写得进，但要你点头**：模型只能调用 `tothestars_propose_*`（提议工具，**零写入**）；用户确认后由引擎确定性执行，并在《向着星》侧留下可撤销的审计记录。
+- **她开得了口**：生活事件桥轮询晨间简报 / 晚间复盘 / 临期未完成 / 连击里程碑等事件，在静默时段与频率上限内主动开口。
+- **四档权限矩阵**：`hidden` 时对应工具**根本不进模型可见的工具表**，而不是靠提示词劝阻；在设置 → 生活数据（向着星）中逐类配置。
+
+完整设计（权限模型 / 写入确认协议 / 审计撤销 / 主动策略 / 接口映射表）见 [`docs/TOTHESTARS-INTEGRATION-PLAN.md`](docs/TOTHESTARS-INTEGRATION-PLAN.md)。
+
+### 怎么用
+
+1. **启动 BetterAgent**（见上文[快速启动](#快速启动)），确认 Go Core WebGateway 已在 `:8080` 就绪，并记下根目录 `.env` 里的 `WEBGATEWAY_TOKEN`。
+
+2. **启动《向着星》**：
+
+   ```bash
+   cd agent/ToTheStarsWeb
+   python -m venv .venv
+   .venv\Scripts\activate          # Windows
+   pip install -r requirements.txt
+   python main.py                  # 浏览器自动打开 http://127.0.0.1:8765
+   ```
+
+3. **打开联动**（在启动《向着星》之前设置环境变量，两套应用都在本机运行）：
+
+   ```powershell
+   # Windows PowerShell
+   $env:AGENT_WS_TOKEN="<BetterAgent 根目录 .env 里的 WEBGATEWAY_TOKEN>"
+   ```
+
+   ```bash
+   # macOS / Linux
+   export AGENT_WS_TOKEN="<BetterAgent 根目录 .env 里的 WEBGATEWAY_TOKEN>"
+   ```
+
+   `AGENT_WS_URL`（默认 `ws://127.0.0.1:8080/ws`）与 `AGENT_CHAT_ID`（默认 `1001`，决定气泡对话在数字人侧的记忆会话）均为可选。**不设置 `AGENT_WS_TOKEN` 时气泡不渲染，功能与单机版完全一致。**
+
+4. **验收联动**：刷新《向着星》页面，右下角出现「和数字人说话」气泡、侧边栏多出「AI 活动」页；发一句话应收到数字人的流式回复；让她改一条委托，应先弹确认框，确认后可在「AI 活动」页撤销。
+
+> 联动接口（全部在本机）：`GET /api/agent/snapshot`（生活快照）、`GET /api/agent/audit`（AI 操作流水）、`POST /api/agent/audit/{id}/undo`（撤销）、`GET /api/agent/chat-config`（气泡连接参数）。
+> 仓库中的语音模型权重（`FurinaCNFinal-e15.ckpt` / `FurinaCNFinal_e8_s304.pth`）与 `ToTheStarsWeb.zip` 因单文件体积超过 GitHub 100MB 上限，按项目 `.gitignore` 的「大文件防爆」规则未纳入版本库，源码本身完整可用。
+
+---
+
+## 实训资料
+
+本仓库 `资料/` 目录收录了本项目的实训提交材料（**仅文档与 PPT，不含源代码与培训课件**）：
+
+| 目录 | 内容 |
+| :--- | :--- |
+| [`资料/A.先启阶段/`](资料/A.先启阶段/) | 配置管理计划书 · 软件需求规约 · 项目开发计划 · 项目进度表 |
+| [`资料/B.精化阶段/`](资料/B.精化阶段/) | 架构设计说明书 · 测试计划 · 测试用例；软件系统分析和设计模型 UML 图（18 张）；原型图（4 张） |
+| [`资料/C.构建阶段/`](资料/C.构建阶段/) | 测试日志 · 测试报告 |
+| [`资料/D.结项答辩/`](资料/D.结项答辩/) | 项目答辩 PPT · 项目开发总结报告 |
+| [`资料/E.全过程/`](资料/E.全过程/) | 项目问题跟踪表 · 项目例会纪要 |
 
 ---
 

@@ -21,11 +21,9 @@ export interface ScheduleAddPayload {
   note?: string
 }
 
-/**
- * WebGateway 会话命名空间偏移（镜像 Go core/internal/idspace/idspace.go 的
- * WebNamespaceOffset）。前端把 WS 子 id 加上该偏移，得到真正的 web chat_id。
- */
-export const WEB_NAMESPACE_OFFSET = 9_000_000_000_000_000
+// 定义搬到了 services/betteragent-ws.ts（WS 协议层才是 chat_id 语义的归属），
+// 这里继续 re-export，调用方（ScheduleHUDWidget.vue）无需改动。
+export { WEB_NAMESPACE_OFFSET } from './betteragent-ws'
 
 const COMPANION_API_BASE = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_COMPANION_API_BASE)
   ? import.meta.env.VITE_COMPANION_API_BASE

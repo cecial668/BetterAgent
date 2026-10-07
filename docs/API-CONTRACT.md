@@ -6,15 +6,6 @@
 
 ---
 
-## 团队分工与 Feature Branch 规划
-
-| 成员 | Feature Branch | 负责模块 | 核心交付 |
-| :--- | :--- | :--- | :--- |
-| **褚裕禄（技术总监）** | `main` / `feat/go-core-*` | Go Core、Frontend、部署、MCP工具 | 架构保障、代码评审、集成 |
-| **谢自立** | `feat/admin-panel` | 任务5：后台管理系统 | Admin REST API + Admin Web UI |
-| **冯文哲** | `feat/campus-kb` | 任务2：校园知识库 RAG | 向量入库服务 + KB Search HTTP API |
-| **张劭哲（TBD）** | `feat/companion-tools` | 任务3补齐：SQL Agent / 日程提醒 / 任务推荐 | Tool 注册 + Companion REST API |
-
 > **防污染原则**：
 >
 > - 组员 **绝对禁止** 修改以下目录/文件：`core/`、`runner.py`、`shared/`、`frontend/`、`config/config.yaml`
@@ -24,7 +15,7 @@
 
 ---
 
-## 接口契约一：校园知识库 RAG 服务（冯文哲）
+## 接口契约一：校园知识库 RAG 服务
 
 **Feature Branch**: `feat/campus-kb`  
 **服务目录**: `services/campus_kb/`  
@@ -130,7 +121,7 @@ GET http://localhost:8093/health
 
 ---
 
-## 接口契约二：后台管理系统（谢自立）
+## 接口契约二：后台管理系统
 
 **Feature Branch**: `feat/admin-panel`  
 **服务目录**: `admin/`  
@@ -154,8 +145,9 @@ GET http://localhost:8094/api/admin/personas
 → 200
 {
   "personas": [
-    { "id": "catgirl", "name": "Camelia", "tts_provider": "gpt_sovits", "voice_id": "catgirl_cute" }
-  ]
+    { "id": "furina", "name": "芙宁娜", "tts_provider": "gpt_sovits", "voice_id": "furina" }
+  ],
+  "active_id": "furina"
 }
 ```
 
@@ -430,7 +422,7 @@ PATCH 成功后，Admin 后端向 NATS 发布 `agent.config.reloaded`，信封�
 ---
 
 
-## 接口契约三：陪伴工具服务（张劭哲）
+## 接口契约三：陪伴工具服务
 
 **Feature Branch**: `feat/companion-tools`  
 **服务目录**: `services/companion/`  
@@ -604,15 +596,15 @@ GET http://localhost:8096/health
 
 | 端口 | 服务 | 负责人 | 状态 |
 | :--- | :--- | :--- | :--- |
-| `4222` | NATS Server | 褚裕禄 | ✅ 已有 |
-| `8080` | Go Core WebGateway (WebSocket) | 褚裕禄 | ✅ 已有 |
-| `8090` | Go Core 游戏事件 HTTP 摄入 | 褚裕禄 | ✅ 已有 |
-| `8091` | TTS Service | 褚裕禄 | ✅ 已有 |
-| `8092` | STT Service | 褚裕禄 | ✅ 已有 |
-| `8093` | **Campus KB RAG Service** | 冯文哲 | ✅ 已实现 |
-| `8094` | **Admin Backend REST API** | 谢自立 | ✅ 已实现 |
-| `8095` | **Admin Web UI (Vite Dev)** | 谢自立 | ✅ 已实现 |
-| `8096` | **Companion Tool Service** | 张劭哲 | ✅ 已实现 |
+| `4222` | NATS Server |  ✅ 已有 |
+| `8080` | Go Core WebGateway (WebSocket) || ✅ 已有 |
+| `8090` | Go Core 游戏事件 HTTP 摄入 || ✅ 已有 |
+| `8091` | TTS Service || ✅ 已有 |
+| `8092` | STT Service || ✅ 已有 |
+| `8093` | **Campus KB RAG Service** || ✅ 已实现 |
+| `8094` | **Admin Backend REST API** || ✅ 已实现 |
+| `8095` | **Admin Web UI (Vite Dev)** || ✅ 已实现 |
+| `8096` | **Companion Tool Service** || ✅ 已实现 |
 
 ---
 
@@ -624,7 +616,7 @@ GET http://localhost:8096/health
 feat/admin-panel        ← 谢自立
 feat/campus-kb          ← 冯文哲
 feat/companion-tools    ← 张劭哲
-feat/go-core-*          ← 褚裕禄（按功能细分）
+feat/go-core-*          ← 褚裕禄
 ```
 
 ### 提交消息（Conventional Commits 格式）

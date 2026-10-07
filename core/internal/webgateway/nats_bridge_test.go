@@ -559,7 +559,7 @@ func TestDeferredTextManager_AddAndPop(t *testing.T) {
 	mgr := newDeferredTextManager()
 	chatID := int64(1001)
 	genID := uint64(1)
-	text := "主人的金枪鱼拿来喵~"
+	text := "今天把报告的最后一段写完了"
 	citations := []schema.Citation{{Content: "test citation", Source: "faq.md"}}
 
 	mgr.Add(chatID, genID, text, true, citations, 500*time.Millisecond, func(cID int64, gID uint64, txt string, final bool, cites []schema.Citation) {
@@ -721,5 +721,107 @@ func TestDeferredTextManager_BargeInClear(t *testing.T) {
 	_, _, _, ok := mgr.PopAndStop(chatID, 1)
 	if ok {
 		t.Errorf("expected item to be cleared by ClearChat")
+	}
+}
+
+// TestHandleActionDecisionMsg_CitationsOnlyFinalDecision_ForwardedToBrowser pins
+// the fix for a real bug: when a reasoning turn's tail flush has no sentence
+// left to speak, cognitive_engine emits a text_content="" + is_final=true
+// ActionDecision carrying that turn's citations (see the final-marker branch in
+// services/cognitive/cognitive_engine.py). The main branch below requires
+// non-empty text, so that decision used to be dropped wholesale and the browser
+// never received the citations -- "她的消息来源" stayed empty, and only looked
+// like it worked intermittently when the tail happened to still hold a sentence.
+func TestHandleActionDecisionMsg_CitationsOnlyFinalDecision_ForwardedToBrowser(t *testing.T) {
+	b, _ := newTestNatsBridge(t)
+	chatID := int64(6006)
+
+	session := newClientSession(chatID, nil, b.logger)
+	b.sessions.Register(session)
+	defer b.sessions.Unregister(session)
+
+	b.handleActionDecisionMsg(actionDecisionMsg(t, schema.ActionDecisionPayload{
+		ChatID:        chatID,
+		GenerationID:  1, // matches the fresh chat's starting generation
+		SourceChannel: "web",
+		ActionType:    "send_message",
+		// The whole point of this test: nothing speakable is left.
+		TextContent: nil,
+		IsFinal:     true,
+		Citations: []schema.Citation{
+			{Content: "上海今天 26 度多云", Source: "https://weather.example/shanghai"},
+			{Content: "明天有雨", Source: "https://weather.example/tomorrow"},
+		},
+	}))
+
+	var deltas []AgentTextDeltaPayload
+	for _, frame := range drainSentFrames(session) {
+		if frame.MessageType != websocket.MessageText {
+			continue
+		}
+		var ws WSMessage
+		if err := json.Unmarshal(frame.Data, &ws); err != nil {
+			t.Fatalf("failed to unmarshal sent frame: %v", err)
+		}
+		if ws.Type != "agent.text_delta" {
+			continue
+		}
+		var payload AgentTextDeltaPayload
+		if err := json.Unmarshal(ws.Payload, &payload); err != nil {
+			t.Fatalf("failed to unmarshal agent.text_delta payload: %v", err)
+		}
+		deltas = append(deltas, payload)
+	}
+
+	if len(deltas) != 1 {
+		t.Fatalf("expected exactly 1 agent.text_delta frame forwarded to the browser, got %d", len(deltas))
+	}
+	got := deltas[0]
+	if got.Text != "" {
+		t.Errorf("expected empty text on the citations-only frame, got %q", got.Text)
+	}
+	if len(got.Citations) != 2 {
+		t.Fatalf("expected 2 citations to survive the forward, got %d", len(got.Citations))
+	}
+	if got.Citations[0].Source != "https://weather.example/shanghai" {
+		t.Errorf("expected the citation source to be forwarded verbatim, got %q", got.Citations[0].Source)
+	}
+	if !got.IsFinal {
+		t.Error("expected is_final to be passed through unchanged")
+	}
+}
+
+// TestHandleActionDecisionMsg_NoTextNoCitations_NoTextDeltaForwarded is the
+// guard rail for the branch above: widening the forward condition must not turn
+// every text-less decision (sticker-only turns, tool-only turns) into an empty
+// subtitle frame on the browser side.
+func TestHandleActionDecisionMsg_NoTextNoCitations_NoTextDeltaForwarded(t *testing.T) {
+	b, _ := newTestNatsBridge(t)
+	chatID := int64(6007)
+
+	session := newClientSession(chatID, nil, b.logger)
+	b.sessions.Register(session)
+	defer b.sessions.Unregister(session)
+
+	b.handleActionDecisionMsg(actionDecisionMsg(t, schema.ActionDecisionPayload{
+		ChatID:        chatID,
+		GenerationID:  1,
+		SourceChannel: "web",
+		ActionType:    "send_message",
+		TextContent:   nil,
+		IsFinal:       true,
+	}))
+
+	for _, frame := range drainSentFrames(session) {
+		if frame.MessageType != websocket.MessageText {
+			continue
+		}
+		var ws WSMessage
+		if err := json.Unmarshal(frame.Data, &ws); err != nil {
+			t.Fatalf("failed to unmarshal sent frame: %v", err)
+		}
+		if ws.Type == "agent.text_delta" {
+			t.Errorf("expected no agent.text_delta frame for a decision with neither text nor citations, got payload %s", string(ws.Payload))
+		}
 	}
 }

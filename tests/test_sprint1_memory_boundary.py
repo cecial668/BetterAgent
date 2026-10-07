@@ -231,7 +231,11 @@ async def test_user_profile_manager_empty_likes_dislikes_formatting():
     mgr.redis_client = None
 
     prompt = await mgr.get_formatted_profile_prompt(user_id)
-    assert "[用户画像] 称呼: 主人, 喜好: 无, 讨厌: 无" in prompt
+    from shared.config_loader import get_config_val
+
+    expected_default = get_config_val("persona.default_user_name", "你")
+    assert f"[用户画像] 称呼: {expected_default}, 喜好: 无, 讨厌: 无" in prompt
+    assert "主人" not in prompt
 
 
 # ============================================================================

@@ -8,7 +8,7 @@ import { useSpeechOutputControlStore } from '../../stores/speech-output-control'
 
 const streamStore = useChatStreamStore()
 const gatewayStore = useBetterAgentGatewayStore()
-const { isSpeaking, csmState, isStreaming, isGracePeriodActive, revealedCaption, citations } = storeToRefs(gatewayStore)
+const { isSpeaking, csmState, isStreaming, isGracePeriodActive, revealedCaption, citations, toolActivity } = storeToRefs(gatewayStore)
 const { speechMuted } = storeToRefs(useSpeechOutputControlStore())
 // Stage.vue keeps this true for as long as it still has BetterAgent audio
 // queued/playing on audioContext's own clock (see betterAgentSilenceTimer),
@@ -62,8 +62,23 @@ watch(displayText, (newVal) => {
 // Stage.vue's own real playback-queue-completion signal (nowSpeaking) -- see its import above for why the latter matters.
 const isVisible = computed(() => {
   const isTalking = nowSpeaking.value || isSpeaking.value || csmState.value === 'talking' || isStreaming.value || isGracePeriodActive.value
-  return isTalking && !!lastNonEmptyText.value
+  // 搜索进行中也要显示：她可能刚说完"等我翻一下"就沉默了，此时 lastNonEmptyText
+  // 有值但状态可能已经不在 talking/streaming 上，光靠 isTalking 会闪掉。
+  return (isTalking && !!lastNonEmptyText.value) || !!toolActivity.value
 })
+
+// 人设化文案由后端按角色卡渲染；万一没给（老版本后端）也不要显示空白。
+const toolActivityText = computed(() => toolActivity.value?.label || '正在查阅资料…')
+
+// 来源优先显示域名，完整 URL 放到 title 里 —— 一长串 URL 会把面板撑爆。
+function prettySource(url: string) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '')
+  }
+  catch {
+    return url
+  }
+}
 
 // Draggable Position State & Pointer Event Handlers
 const el = ref<HTMLElement>()
@@ -169,6 +184,26 @@ const citationsExpanded = ref(false)
           </div>
         </div>
 
+        <!-- Tool activity (Layer 4)：搜索这类要花几秒的工具在跑时，用一行带呼吸光的
+             提示告诉用户"她在查"，否则这几秒看起来就是卡死了。 -->
+        <Transition
+          enter-active-class="transition-opacity duration-200"
+          enter-from-class="opacity-0"
+          leave-active-class="transition-opacity duration-300"
+          leave-to-class="opacity-0"
+        >
+          <div
+            v-if="toolActivity"
+            class="tool-activity-glow mx-5 mb-1 flex items-center gap-2 self-start rounded-full border border-sky-400/30 bg-sky-50/80 px-3 py-1 text-xs font-medium text-sky-700 dark:border-sky-400/20 dark:bg-sky-500/10 dark:text-sky-300"
+          >
+            <span class="relative flex h-2 w-2 flex-shrink-0">
+              <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75" />
+              <span class="relative inline-flex h-2 w-2 rounded-full bg-sky-500" />
+            </span>
+            <span>{{ toolActivityText }}</span>
+          </div>
+        </Transition>
+
         <!-- Subtitle Content -->
         <div class="break-words px-5 pb-3.5 pt-1 text-sm font-medium leading-relaxed tracking-wide text-neutral-800 md:text-base dark:text-neutral-100">
           {{ lastNonEmptyText }}
@@ -181,7 +216,7 @@ const citationsExpanded = ref(false)
             class="flex items-center gap-1 text-[11px] font-medium text-neutral-400 transition-colors hover:text-pink-500 dark:text-neutral-500"
             @click.stop="citationsExpanded = !citationsExpanded"
           >
-            参考资料 ({{ citations.length }})
+            她的消息来源 ({{ citations.length }})
             <div :class="citationsExpanded ? 'i-carbon-chevron-up' : 'i-carbon-chevron-down'" />
           </button>
           <ul v-if="citationsExpanded" class="mt-2 flex flex-col gap-2">
@@ -190,9 +225,19 @@ const citationsExpanded = ref(false)
               :key="i"
               class="rounded-lg bg-neutral-100/70 p-2 text-xs text-neutral-600 dark:bg-neutral-800/60 dark:text-neutral-300"
             >
-              <div class="mb-1 text-[10px] font-medium uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
-                {{ c.source }}
-              </div>
+              <!-- 可点击：来源是这个面板存在的意义，做成纯文本等于让人手动抄 URL。
+                   @click.stop 是必须的 —— 外层容器有指针拖拽处理，不拦住的话点击会被吞掉。 -->
+              <a
+                v-if="c.source"
+                :href="c.source"
+                target="_blank"
+                rel="noopener noreferrer"
+                :title="c.source"
+                class="mb-1 block truncate text-[10px] font-medium tracking-wider text-sky-600 underline decoration-sky-400/40 underline-offset-2 transition-colors hover:text-sky-500 dark:text-sky-400 dark:hover:text-sky-300"
+                @click.stop
+              >
+                {{ prettySource(c.source) }}
+              </a>
               <div class="line-clamp-3 leading-relaxed">
                 {{ c.content }}
               </div>
@@ -203,3 +248,30 @@ const citationsExpanded = ref(false)
     </div>
   </Transition>
 </template>
+
+<style scoped>
+/* 呼吸光：明暗与光晕一起起伏，比旋转菊花更安静，不会抢字幕的注意力。 */
+@keyframes tool-activity-breathe {
+  0%,
+  100% {
+    opacity: 0.85;
+    box-shadow: 0 0 0 0 rgb(56 189 248 / 0.35), 0 0 10px 0 rgb(56 189 248 / 0.2);
+  }
+
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 0 6px rgb(56 189 248 / 0), 0 0 20px 4px rgb(56 189 248 / 0.45);
+  }
+}
+
+.tool-activity-glow {
+  animation: tool-activity-breathe 1.9s ease-in-out infinite;
+}
+
+/* 尊重系统的"减少动态效果"设置：关掉动画但不隐藏提示。 */
+@media (prefers-reduced-motion: reduce) {
+  .tool-activity-glow {
+    animation: none;
+  }
+}
+</style>

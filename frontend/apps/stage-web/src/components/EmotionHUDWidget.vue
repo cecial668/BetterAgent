@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { useBetterAgentGatewayStore } from '@proj-airi/stage-ui/stores/modules/betteragent-gateway'
+import { usePersonaStore } from '@proj-airi/stage-ui/stores/persona'
 import { breakpointsTailwind, useBreakpoints, useResizeObserver, useScreenSafeArea } from '@vueuse/core'
 import { DialogContent, DialogOverlay, DialogPortal, DialogRoot } from 'reka-ui'
 import { DrawerContent, DrawerHandle, DrawerOverlay, DrawerPortal, DrawerRoot } from 'vaul-vue'
 import { computed, onMounted } from 'vue'
 
 const gatewayStore = useBetterAgentGatewayStore()
+const personaStore = usePersonaStore()
 const showDialog = defineModel<boolean>({ default: false })
 
 const breakpoints = useBreakpoints(breakpointsTailwind)
@@ -13,7 +15,15 @@ const isDesktop = breakpoints.greaterOrEqual('md')
 const screenSafeArea = useScreenSafeArea()
 
 useResizeObserver(document.documentElement, () => screenSafeArea.update())
-onMounted(() => screenSafeArea.update())
+onMounted(() => {
+  screenSafeArea.update()
+  // 面板标题显示当前角色名；没设人设（空白卡）时保持中性标题，不预置任何名字。
+  personaStore.fetchRemote().catch(() => {})
+})
+
+/** 当前生效的角色名；空白卡/取不到时为空串 → 标题退化为「情绪指标」。 */
+const personaName = computed(() => (personaStore.mergedPersona?.name || '').trim())
+const hudTitle = computed(() => (personaName.value ? `${personaName.value} 情绪指标` : '情绪指标'))
 
 const emoState = computed(() => gatewayStore.emotionalState)
 
@@ -66,8 +76,8 @@ const satietyPercent = computed(() => {
           <!-- Header & Mood Badge -->
           <div class="flex items-center justify-between border-b border-neutral-800 pb-2.5">
             <div class="flex items-center gap-2 font-semibold text-base">
-              <div class="i-solar:cat-bold text-primary-400 text-lg" />
-              <span>Camelia 情绪指标</span>
+              <div class="i-solar:heart-pulse-bold text-primary-400 text-lg" />
+              <span>{{ hudTitle }}</span>
             </div>
             <div class="flex items-center gap-2">
               <span class="rounded-full border px-2.5 py-0.5 font-mono text-xs font-bold" :class="moodColorClass">
@@ -181,8 +191,8 @@ const satietyPercent = computed(() => {
           <!-- Header & Mood Badge -->
           <div class="flex items-center justify-between border-b border-neutral-800 pb-3 mb-3">
             <div class="flex items-center gap-2 font-semibold text-base">
-              <div class="i-solar:cat-bold text-primary-400 text-lg" />
-              <span>Camelia 情绪指标</span>
+              <div class="i-solar:heart-pulse-bold text-primary-400 text-lg" />
+              <span>{{ hudTitle }}</span>
             </div>
             <span class="rounded-full border px-2.5 py-0.5 font-mono text-xs font-bold" :class="moodColorClass">
               {{ emoState?.mood || 'NEUTRAL' }}

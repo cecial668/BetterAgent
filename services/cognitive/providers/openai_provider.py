@@ -87,6 +87,21 @@ class OpenAIProvider(BaseLLMProvider):
         # Most modern OpenAI models support tool calling; DeepSeek-R1 pure reasoning can disable if needed
         return True
 
+    def _supports_reasoning_passthrough(self) -> bool:
+        """本端点是否要求 assistant 消息回传 `reasoning_content`。
+
+        DeepSeek 的 thinking 模式有一条硬规则：**只要请求带 tools 参数，历史里带
+        tool_calls 的 assistant 消息就必须把当轮的 reasoning_content 一并回传**，
+        否则第二轮（也就是把工具结果喂回去的那一轮）直接 400：
+            "The `reasoning_content` in the thinking mode must be passed back to the API."
+
+        而 reasoning_content 不是 OpenAI 标准字段，发给 OpenAI / Qwen / Ollama 等
+        端点会被判为非法参数，所以这里按 provider 收口，不做全局开启。
+        """
+        if self.provider_name.lower() == "deepseek":
+            return True
+        return "api.deepseek.com" in (self.base_url or "").lower()
+
     async def health_check(self) -> bool:
         """Lightweight API probe to verify connectivity and key validity."""
         try:
@@ -125,6 +140,29 @@ class OpenAIProvider(BaseLLMProvider):
                 continue
 
             if role == "user":
+                # Tool round trip (CognitiveEngine._append_tool_round_trip writes
+                # role="user" + metadata.function_response). This branch used to
+                # be dropped -- the model never saw any non-fire-and-forget tool
+                # result (search_campus_kb / web_search / presenter MCP tools),
+                # so it could only guess instead of reading the real output.
+                # Mirrors the role=="tool" branch below: pair the result with the
+                # tool_call id emitted for the preceding function_call.
+                function_response = metadata.get("function_response")
+                if isinstance(function_response, dict):
+                    if pending_tool_call_ids:
+                        matched_id = pending_tool_call_ids.pop(0)
+                    else:
+                        matched_id = f"call_{call_counter}"
+                        call_counter += 1
+                    tool_result = function_response.get("response")
+                    openai_msgs.append({
+                        "role": "tool",
+                        "tool_call_id": matched_id,
+                        "content": tool_result if isinstance(tool_result, str)
+                        else json.dumps(tool_result if tool_result is not None else {}, ensure_ascii=False),
+                    })
+                    continue
+
                 # Handle multimodal vision_frame if present
                 vision_frame = metadata.get("vision_frame")
                 if vision_frame and isinstance(vision_frame, dict):
@@ -153,15 +191,15 @@ class OpenAIProvider(BaseLLMProvider):
                             continue
                 openai_msgs.append({"role": "user", "content": content})
 
-            elif role == "assistant":
+            elif role in ("assistant", "model"):
                 msg_obj: Dict[str, Any] = {"role": "assistant"}
                 if content:
                     msg_obj["content"] = content
 
                 # If metadata contains assistant tool calls, format tool_calls array with unique IDs
                 tool_calls_meta = metadata.get("tool_calls") or msg.get("tool_calls")
+                formatted_calls: List[Dict[str, Any]] = []
                 if tool_calls_meta and isinstance(tool_calls_meta, list):
-                    formatted_calls = []
                     for call in tool_calls_meta:
                         call_id = call.get("id") or f"call_{call_counter}"
                         call_counter += 1
@@ -176,7 +214,46 @@ class OpenAIProvider(BaseLLMProvider):
                             "type": "function",
                             "function": {"name": fn_name, "arguments": args_str},
                         })
+
+                # Same round-trip pair, first half: CognitiveEngine writes
+                # role="model" + metadata.function_call. Emit it as an assistant
+                # message carrying tool_calls so the following role="tool" result
+                # has something to attach to (OpenAI-compatible endpoints reject
+                # an orphan tool message).
+                # DeepSeek thinking 模式要求与 tool_calls 同轮回传的思考过程。
+                # 由 CognitiveEngine._append_tool_round_trip 写进 metadata。
+                reasoning_content = metadata.get("reasoning_content") or ""
+
+                function_call = metadata.get("function_call")
+                if isinstance(function_call, dict) and function_call.get("name"):
+                    call_id = f"call_{call_counter}"
+                    call_counter += 1
+                    pending_tool_call_ids.append(call_id)
+                    fn_args = function_call.get("args", {})
+                    formatted_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": function_call.get("name", ""),
+                            "arguments": json.dumps(fn_args, ensure_ascii=False) if isinstance(fn_args, dict) else str(fn_args),
+                        },
+                    })
+
+                if formatted_calls:
                     msg_obj["tool_calls"] = formatted_calls
+                    # DeepSeek 与部分 OpenAI 兼容端点要求带 tool_calls 的 assistant
+                    # 消息里 content 字段必须存在（可为空串），省略会直接 400。
+                    msg_obj.setdefault("content", "")
+                    # DeepSeek thinking 模式的第二道 400 门槛：请求带 tools 时，带
+                    # tool_calls 的 assistant 消息必须回传当轮 reasoning_content。
+                    # 该字段非 OpenAI 标准，故仅对 DeepSeek 端点开启。
+                    if reasoning_content and self._supports_reasoning_passthrough():
+                        msg_obj["reasoning_content"] = reasoning_content
+
+                # An assistant message with neither text nor tool_calls is
+                # rejected by some strict OpenAI-compatible endpoints; skip it.
+                if "content" not in msg_obj and "tool_calls" not in msg_obj:
+                    continue
 
                 openai_msgs.append(msg_obj)
 
@@ -434,6 +511,10 @@ class OpenAIProvider(BaseLLMProvider):
         tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
         yielded_something = False
         text_buffer = ""
+        # DeepSeek thinking 模式：本轮的思考过程必须原样回传给下一轮（见
+        # _supports_reasoning_passthrough 的说明），所以这里要累积而不是只当作
+        # 展示用的 thinking_delta 转发出去就丢掉。
+        reasoning_buffer = ""
 
         try:
             stream = await client.chat.completions.create(**kwargs)
@@ -453,6 +534,7 @@ class OpenAIProvider(BaseLLMProvider):
                     reasoning_content = getattr(delta, "reasoning_content", None)
                     if reasoning_content:
                         yielded_something = True
+                        reasoning_buffer += reasoning_content
                         yield {"type": "thinking_delta", "text": reasoning_content}
 
                     # 2. Text Delta (with full JSON & pseudo-tool call buffering)
@@ -590,7 +672,14 @@ class OpenAIProvider(BaseLLMProvider):
                 except Exception:
                     pass
 
-                yield {"type": "tool_calls", "calls": parsed_calls}
+                # reasoning_content 与 calls 一起交出：引擎会把它挂到本轮
+                # (function_call, function_response) 那对消息上，下一轮才能带着它
+                # 重新发给 DeepSeek（否则 HTTP 400，见 _supports_reasoning_passthrough）。
+                yield {
+                    "type": "tool_calls",
+                    "calls": parsed_calls,
+                    "reasoning_content": reasoning_buffer,
+                }
 
         except Exception as err:
             err_str = str(err)

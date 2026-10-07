@@ -186,6 +186,54 @@ type EmotionUpdatePayload struct {
 	Action  string `json:"action,omitempty"`
 }
 
+// ToolActivityPayload mirrors shared/schema/payloads.py's ToolActivityPayload
+// field-for-field (the Python cognitive service publishes it; WebGateway
+// unmarshals it and forwards it as an agent.tool_activity WS frame).
+type ToolActivityPayload struct {
+	BasePayload
+	ChatID int64  `json:"chat_id"`
+	Tool   string `json:"tool"`
+	Phase  string `json:"phase"`
+	Label  string `json:"label,omitempty"`
+}
+
+// LifeProposalPayload mirrors shared/schema/payloads.py's
+// LifeProposalPayload: a 向着星 write-proposal confirmation-box event
+// (pending/executing/executed/failed/cancelled/expired), forwarded to the
+// browser as an agent.life_proposal WS frame.
+type LifeProposalPayload struct {
+	BasePayload
+	ChatID     int64                  `json:"chat_id"`
+	ProposalID string                 `json:"proposal_id"`
+	Phase      string                 `json:"phase"`
+	Kind       string                 `json:"kind,omitempty"`
+	Params     map[string]interface{} `json:"params,omitempty"`
+	Summary    string                 `json:"summary,omitempty"`
+	Message    string                 `json:"message,omitempty"`
+}
+
+// FocusCommandPayload mirrors shared/schema/payloads.py's
+// FocusCommandPayload: the cognitive engine's deterministic focus-mode
+// commands (start/pause/resume/end). Go's FocusManager owns the timer and
+// turns each command into an agent.focus_state broadcast.
+type FocusCommandPayload struct {
+	BasePayload
+	ChatID  int64  `json:"chat_id"`
+	Action  string `json:"action"` // "start" | "pause" | "resume" | "end"
+	Minutes int    `json:"minutes,omitempty"`
+	Outcome string `json:"outcome,omitempty"` // "completed" | "abandoned", informational
+}
+
+// NoticePayload mirrors shared/schema/payloads.py's NoticePayload: a
+// lightweight UI-only notice (no LLM turn, no TTS), forwarded to browsers as
+// an agent.notice WS frame.
+type NoticePayload struct {
+	BasePayload
+	Level   string `json:"level,omitempty"` // "info" | "warn"
+	Title   string `json:"title,omitempty"`
+	Message string `json:"message"`
+}
+
 type UserInterruptPayload struct {
 	BasePayload
 	ChatID int64 `json:"chat_id"`

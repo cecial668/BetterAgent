@@ -34,7 +34,7 @@ Concise but detailed reference for contributors and AI agents working across the
   - Styles & Tokens: `frontend/uno.config.ts`
 - **Configuration & Personas (`config/`)**
   - Global config: `config/config.yaml`
-  - Persona YAMLs: `config/persona/*.yaml` (e.g. `catgirl.yaml`, `patra.yaml`)
+  - Persona YAMLs: `config/persona/*.yaml` (e.g. `blank.yaml`, `furina.yaml`)
 - **Single Source of Truth (`docs/ARCHITECTURE.md`)**
   - Complete SRS and architecture spec including microservice topology, sequence diagrams, state machine transition diagrams, and NATS payload schemas.
 
